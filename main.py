@@ -24,15 +24,15 @@ instance = client.instance(INSTANCE_ID)
 
 router = instance.table("router")
 message = instance.table("message")
-uaids = []
-rows = []
 
 
 def calc_ttl(now:datetime, ttl:int) -> int:
+    ### convenience function for genering an integer TTL offset.
     return int((now + datetime.timedelta(seconds=ttl)).timestamp())
 
 
 def populate_chids(uaid:str, options:Values):
+    ### create some fake pending messages.
     print("Creating 'channels'")
     for i in range(1, random.randint(2,10)):
         now = datetime.datetime.utcnow()
@@ -58,6 +58,7 @@ def populate_chids(uaid:str, options:Values):
 
 
 def populate(options:Values):
+    ### Stuff them tables with crap
     print("Writing router records...")
 
     for i in range(1,10):
@@ -76,12 +77,11 @@ def populate(options:Values):
         rr = row.commit()
         if rr.ListFields() != []:
             print(rr)
-        rows.append(row)
 
         # create fake chids
         populate_chids(uaid, options)
 
-
+    # modify the uaids, (originally to determine if the timestamps changed and when the expiry kicked in)
     if options.m:
         for i in range (1, 20):
             uaid = random.choice(uaids)
@@ -90,13 +90,17 @@ def populate(options:Values):
             now = datetime.datetime.utcnow()
             try:
                 if options.m:
+                    # this modifies (appends or increments) row values.
                     row = router.append_row(uaid)
                     row.append_cell_value(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()).to_bytes(4, "big"))
                     row.append_cell_value(column_family_id=DEFAULT_FAMILY, column="node_id", value=node_id)
                     rr = row.commit()
+                    # super fun! these commits return different value types.
                     if len(rr) > 0:
                         print(rr)
                 else:
+                    # this creates a new cell instance.
+                    # (TODO: can we delete individual cells?)
                     row = router.direct_row(uaid)
                     row.set_cell(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()), timestamp=now)
                     row.set_cell(column_family_id=DEFAULT_FAMILY, column="node_id", value=node_id, timestamp=now)
@@ -116,6 +120,7 @@ def populate(options:Values):
 
 
 def print_row(row:row.PartialRowData):
+    ### Taken from the example code.
     print("Reading data for {}:".format(row.row_key.decode("utf-8")))
     """
     odict_items(
@@ -179,25 +184,31 @@ def print_row(row:row.PartialRowData):
 
 
 def dump_row(target_uaid):
+    ### Dump info for a target_uaid
+    # show the router info
     rrow = router.read_row(target_uaid)
     print_row(rrow)
+    # show the "messages" that might be for this UAID.
     # this appears to match only cells that have this value, regardless of column name.
     #filter = row_filters.ValueRangeFilter(start_value=int.to_bytes(int(datetime.datetime.utcnow().timestamp()), length=8, byteorder="big"))
     filter = row_filters.RowKeyRegexFilter(f"^{target_uaid}#.*".encode("utf-8"))
-    vv = message.read_rows(
+    all_rows = message.read_rows(
         filter_=filter
     )
-    #print(set)
+    ## wasn't super sure may revisit this. Specifying the start/end key may limit scan.
     # vv = router.read_rows(start_key="0", end_key="fffffffffffffffffffffff")
     # print(vv)
-    for row in vv:
+    for row in all_rows:
         print_row(row)
 
 
 def get_uaids():
+    ### fetch all the UAIDs we have. Including broken ones.
+    # this is actually pretty expensive. It's a table scan.
+    # StripValue... replaces the values with empty strings.
+    # (If this is hadoop like, it still fetches them, it just strips before sending)
     filter = row_filters.StripValueTransformerFilter(True)
     rows = router.read_rows(filter_=filter)
-    # list comprehension doesn't appear to work here.
     return [row.row_key for row in rows]
 
 
