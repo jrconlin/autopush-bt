@@ -31,6 +31,7 @@ rows = []
 def calc_ttl(now:datetime, ttl:int) -> int:
     return int((now + datetime.timedelta(seconds=ttl)).timestamp())
 
+
 def populate_chids(uaid:str, options:Values):
     print("Creating 'channels'")
     for i in range(1, random.randint(2,10)):
@@ -80,40 +81,39 @@ def populate(options:Values):
         # create fake chids
         populate_chids(uaid, options)
 
-    # vv = router.mutate_rows(rows)
-    # print(vv)
+
+    if options.m:
+        for i in range (1, 20):
+            uaid = random.choice(uaids)
+            print(f"{i:>3}: tweaking {uaid}")
+            node_id = "https://example.com:8082/" + uuid.uuid4().hex
+            now = datetime.datetime.utcnow()
+            try:
+                if options.m:
+                    row = router.append_row(uaid)
+                    row.append_cell_value(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()).to_bytes(4, "big"))
+                    row.append_cell_value(column_family_id=DEFAULT_FAMILY, column="node_id", value=node_id)
+                    rr = row.commit()
+                    if len(rr) > 0:
+                        print(rr)
+                else:
+                    row = router.direct_row(uaid)
+                    row.set_cell(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()), timestamp=now)
+                    row.set_cell(column_family_id=DEFAULT_FAMILY, column="node_id", value=node_id, timestamp=now)
+                    rr = row.commit()
+                    if rr != "":
+                        print(rr)
+            except Exception as ex:
+                print (ex)
+            #rr = router.mutate_rows([row])
+            #if rr != "":
+            #    print(rr)
+            sleep_period = random.randrange(options.s)
+            print(f"Sleeping {sleep_period} seconds")
+            time.sleep(sleep_period)
+
     return(uaids)
 
-    """
-    for i in range (1, 20):
-        uaid = random.choice(uaids)
-        print(f"{i:>3}: tweaking {uaid}")
-        node_id = "https://example.com:8082/" + uuid.uuid4().hex
-        now = datetime.datetime.utcnow()
-        try:
-            if options.m:
-                row = router.append_row(uaid)
-                row.append_cell_value(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()).to_bytes(4, "big"))
-                row.append_cell_value(column_family_id=DEFAULT_FAMILY, column="node_id", value=node_id)
-                rr = row.commit()
-                if len(rr) > 0:
-                    print(rr)
-            else:
-                row = router.direct_row(uaid)
-                row.set_cell(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()), timestamp=now)
-                row.set_cell(column_family_id=DEFAULT_FAMILY, column="node_id", value=node_id, timestamp=now)
-                rr = row.commit()
-                if rr != "":
-                    print(rr)
-        except Exception as ex:
-            print (ex)
-        #rr = router.mutate_rows([row])
-        #if rr != "":
-        #    print(rr)
-        sleep_period = random.randrange(options.s)
-        print(f"Sleeping {sleep_period} seconds")
-        time.sleep(sleep_period)
-    """
 
 def print_row(row:row.PartialRowData):
     print("Reading data for {}:".format(row.row_key.decode("utf-8")))
@@ -177,6 +177,7 @@ def print_row(row:row.PartialRowData):
                 )
     print("")
 
+
 def dump_row(target_uaid):
     rrow = router.read_row(target_uaid)
     print_row(rrow)
@@ -192,11 +193,13 @@ def dump_row(target_uaid):
     for row in vv:
         print_row(row)
 
+
 def get_uaids():
     filter = row_filters.StripValueTransformerFilter(True)
     rows = router.read_rows(filter_=filter)
     # list comprehension doesn't appear to work here.
     return [row.row_key for row in rows]
+
 
 def args():
     parser = OptionParser()
