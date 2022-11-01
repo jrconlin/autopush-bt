@@ -156,15 +156,16 @@ def populate(options:Values):
         # register some channels
         chids = []
         msg_count = 0
-        for i in range(0, random.randint(10)):
+        for i in range(0, random.randint(1, 10)):
             chids.append(register_channel(uaid, options))
         # and populate them with messages.
-        for j in range(0, random.randint(10)):
+        for j in range(0, random.randint(1, 10)):
             chid = random.choice(chids)
-            for k in range(1, random.randrange(1,5)):
-                create_message(chid)
+            for k in range(1, random.randint(1,5)):
+                create_message(chid, now)
             msg_count += k
         print (f"{uaid}: Created {i} channels {msg_count} messages")
+    return(uaids)
 
 
 def get_pending(target_uaid:str, options:Values):
@@ -325,6 +326,7 @@ def get_args():
     parser.add_option("--sleep", "-s", type=int, default=0, help="max sleep seconds between modifications")
     parser.add_option("--display", action="store_true", default=False, help="display uaid")
     parser.add_option("--register", action="store_true", default=False, help="register some channels")
+    parser.add_option("--list_chids", action="store_true", default=False, help="Display a list of known CHIDs for a UAID")
     parser.add_option("--list_uaids", action="store_true", default=False, help="Display a list of known UAIDs")
     parser.add_option("--load", action="store_true", default=False, help="Load a UAID with fake messages")
     parser.add_option("--dump", action="store_true", default=False, help="Dump a UAID")
@@ -337,10 +339,23 @@ def get_args():
 def drop_all(uaid):
     ### drop this UAID and everything we know about it. (surprisingly expensive.)
     print(f"dropping {uaid}", end="")
-    now = time.time()
+    now = datetime.datetime.utcnow()
+    # There's a limit on how many `drop_by_prefix` we can do.
     router.drop_by_prefix(uaid)
     message.drop_by_prefix(uaid)
-    duration = time.time() - now
+
+    """
+    # Sadly, this doesn't work. Quite.
+    # So, you can specify a different column_family_id, and that GC will be
+    # enforced, but it does not alter the column_families of the prior
+    # entries.
+    row = router.direct_row(uaid)
+    row.set_cell(column_family_id=MESSAGE_FAMILY, column="connected_at", value=int(now.timestamp()), timestamp=now)
+    row.set_cell(column_family_id=MESSAGE_FAMILY, column="router_type", value="", timestamp=now)
+    row.set_cell(column_family_id=MESSAGE_FAMILY, column="node_id", value="", timestamp=now)
+    row.commit()
+    """
+    duration = datetime.datetime.utcnow() - now
     print(f" Duration {duration}")
     uaids = get_uaids()
     print(f" remaining: {uaids}")
@@ -353,32 +368,39 @@ def target_uaid(options:Values):
 
 def main():
     (options, _args) = get_args()
+    start = datetime.datetime.utcnow()
 
     if options.populate:
         uaids = populate(options)
         print(f"  UAIDS: {uaids}")
+        print(f"Duration {datetime.datetime.utcnow() - start}")
         exit()
 
     if options.ack:
         clear_chid(options.ack)
+        print(f"Duration {datetime.datetime.utcnow() - start}")
         exit()
 
     if options.process:
         process_uaid(target_uaid(options), options)
+        print(f"Duration {datetime.datetime.utcnow() - start}")
         exit()
 
     if options.load:
         load_uaid(target_uaid(options), options)
+        print(f"Duration {datetime.datetime.utcnow() - start}")
         exit()
 
     if options.drop:
         drop_all(target_uaid(options))
+        print(f"Duration {datetime.datetime.utcnow() - start}")
         exit()
 
     if options.register:
         target = target_uaid(options)
         for i in range(1, random.randrange(1,10)):
             register_channel(target, options)
+        print(f"Duration {datetime.datetime.utcnow() - start}")
         exit()
 
     if options.dump:
@@ -389,15 +411,20 @@ def main():
 
     if options.list_uaids:
         uaids = get_uaids()
-        print(f"  UAIDS: {uaids}")
+        print(f"  UAIDs: {uaids}\nDuration {datetime.datetime.utcnow() - start}")
         exit()
+
+    if options.list_chids:
+        chids = get_chids(target_uaid(options), options)
+        print(f"  CHIDs: {chids}\nDuration {datetime.datetime.utcnow() - start}")
+        exit()
+
 
     if options.display:
         target = target_uaid(options)
         dump_uaid(target)
-        now = time.time()
         chids = get_chids(target, options)
-        print(f"  CHIDS: {chids}: {time.time() - now}")
+        print(f"  CHIDS: {chids}:\nDuration {datetime.datetime.utcnow() - start}")
         exit()
 
     if options.prune:
@@ -406,8 +433,10 @@ def main():
             chids = get_chids(uaid, options)
             if not chids:
                 drop_all(uaid)
+        print(f"Duration {datetime.datetime.utcnow() - start}")
         exit()
 
     connect_uaid(target_uaid(options), options)
+    print(f"Duration {datetime.datetime.utcnow() - start}")
 
 main()
