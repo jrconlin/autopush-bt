@@ -49,7 +49,8 @@ def get_chids(uaid:str, options:Values):
     result = []
     # is there no way to get the count of rows without iterating?
     for row in all_rows:
-        result.append(row.row_key.decode())
+        if not row.to_dict().get(f"{DEFAULT_FAMILY}:dead".encode()):
+            result.append(row.row_key.decode())
     # BigTable loves to return duplicates.
     return list(set(result))
 
@@ -66,11 +67,12 @@ def create_uaid(connected_at: datetime, router_type:str, node_id:str, options:Va
     # not sure we need this if we use column family expiry rules.
     # row.set_cell(column_family_id=DEFAULT_FAMILY, column="expiry", value=int(calc_ttl(now, 300).timestamp()), timestamp=now)
 
-    print(f"Creating UAID: {uaid}")
+    print(f"Creating UAID: {uaid}", end="")
     rr = row.commit()
+    print("✔")
     if rr.ListFields() != []:
         # `commit` can return errors. It does not raise exceptions.
-        print(f"DIRECT COMMIT ERROR: {rr}")
+        raise Exception(f"DIRECT COMMIT ERROR: {rr}")
     return uaid
 
 def register_channel(uaid: str, options:Values) -> str:
@@ -81,11 +83,13 @@ def register_channel(uaid: str, options:Values) -> str:
 
     row = message.direct_row(key)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="created", value=int(now.timestamp()))
+    print("registering new channel ", end="")
     rr = row.commit()
+    print("✔")
 
     print(f" created {key}")
     if rr.ListFields() != []:
-        print(f"DIRECT COMMIT ERROR: {rr}")
+        raise Exception(f"DIRECT COMMIT ERROR: {rr}")
 
     return key
 
@@ -100,28 +104,34 @@ def create_message(key:str, now:datetime):
     })
     # give it some ttl (in seconds)
     ttl = calc_ttl(now, random.randint(60,10000))
+    row = message.read_row(key)
+    if row.to_dict().get(f"{DEFAULT_FAMILY}:dead".encode()):
+        print(f"☠{key}:404")
 
     row = message.direct_row(key)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="sortkey_timestamp", value=int(now.timestamp()), timestamp=now)
     row.set_cell(column_family_id=MESSAGE_FAMILY, column="data", value=data, timestamp=ttl)
     row.set_cell(column_family_id=MESSAGE_FAMILY, column="headers", value=headers, timestamp=ttl)
-    print(f"  New message for {key} dies in {ttl-now}")
+    print(f"  New message for {key} dies in {ttl-now}", end="")
     res = row.commit()
+    print("✔")
 
     if res.ListFields() != []:
-        print (f"DIRECT COMMIT ERROR: {res}")
+        raise Exception(f"DIRECT COMMIT ERROR: {res}")
 
 def clear_chid(key: str):
     ### delete all data for this uaid#chid, mocks an `ack`
-    print(f" Clearing {key}")
 
     row = message.row(key)
     row.delete_cells(column_family_id=MESSAGE_FAMILY, columns=["data", "headers"])
+    print(f" Clearing {key}", end="")
     res = row.commit()
+    print(f" ✔")
+
 
     # so, if things fail, `commit` doesn't throw an exception. Instead, the result value contains the error.
     if res.ListFields() != []:
-        print (f"CONDITION COMMIT ERROR: {res}")
+        raise Exception(f"CONDITION COMMIT ERROR: {res}")
 
 
 def process_uaid(uaid:str, options:Values):
@@ -177,13 +187,15 @@ def get_pending(target_uaid:str, options:Values):
     results = []
     for row in all_rows:
         for _cf, cols in row.cells.items():
+            if cols.get(b'dead'):
+                next
             for data in cols.get(b'data') or []:
                 results.append((row.row_key.decode(), len(data.value)))
     return results
 
 def connect_uaid(uaid:str, options:Values):
     ### Pretend a UAID connected
-    print(f"checking {uaid}")
+    print(f"checking {uaid}", end="")
     node_id = "https://example.com:8082/" + uuid.uuid4().hex
     now = datetime.datetime.utcnow()
 
@@ -201,6 +213,7 @@ def connect_uaid(uaid:str, options:Values):
         timestamp=now
     )
     rr = row.commit()
+    print(f"✔")
 
     """
     # append_cell copies the prior content, and appends data to it. It
@@ -213,7 +226,7 @@ def connect_uaid(uaid:str, options:Values):
     count = 0
     for message in messages:
         count += 1
-        print(f"{count}, {message}")
+        print(f"{count:>3}, {message}")
 
 
 def print_row(row:row.PartialRowData):
@@ -316,25 +329,6 @@ def get_uaids(limit: int=0):
         return result[:limit]
     return result
 
-def get_args():
-    parser = OptionParser()
-    parser.add_option("--populate", "-p", type=int, default=0, help="populate this many")
-    parser.add_option("--uaid", type=str, help="target uaid")
-    parser.add_option("--ack", type=str, help="ack a UAID#CHID")
-    parser.add_option("--process", action="store_true", default=False, help="process a UAID")
-    parser.add_option("--modify", "-m", action="store_true", default=False, help="modify")
-    parser.add_option("--sleep", "-s", type=int, default=0, help="max sleep seconds between modifications")
-    parser.add_option("--display", action="store_true", default=False, help="display uaid")
-    parser.add_option("--register", action="store_true", default=False, help="register some channels")
-    parser.add_option("--list_chids", action="store_true", default=False, help="Display a list of known CHIDs for a UAID")
-    parser.add_option("--list_uaids", action="store_true", default=False, help="Display a list of known UAIDs")
-    parser.add_option("--load", action="store_true", default=False, help="Load a UAID with fake messages")
-    parser.add_option("--dump", action="store_true", default=False, help="Dump a UAID")
-    parser.add_option("--drop", action="store_true", help="drop a UAID and all records")
-    parser.add_option("--skip_create", action="store_true", default=False, help="Don't create new UAIDs")
-    parser.add_option("--prune", action="store_true", default=False, help="Prune empty UAIDs")
-
-    return parser.parse_args()
 
 def drop_all(uaid):
     ### drop this UAID and everything we know about it. (surprisingly expensive.)
@@ -359,65 +353,139 @@ def drop_all(uaid):
     print(f" Duration {duration}")
     uaids = get_uaids()
     print(f" remaining: {uaids}")
-    time.sleep(1)  # because there's a rate limit of ~100/m on row drops :facepalm:
 
+def drop_chid(key):
+    ### deletes are rate limited, so fake one by creating a "dead" record.
+    # TODO: Figure out how to prune these?
+    print(f"clearing chid {key}", end="")
+    row = message.direct_row(key)
+    now = datetime.datetime.utcnow()
+    row.set_cell(column_family_id=DEFAULT_FAMILY, column="dead", value=True, timestamp=now)
+    row.commit()
+    print("✔")
 
 def target_uaid(options:Values):
     ### return the `uaid` parameter, or just pick one at random.
     return options.uaid or random.choice(get_uaids())
 
+
+def register(options:Values):
+    # register a UAID and add some random channels.
+    now = datetime.datetime.utcnow()
+    connected_at = now
+    router_type = "webpush"
+    node_id = "https://example.com:8082/" + uuid.uuid4().hex
+    uaid = create_uaid(connected_at=connected_at, router_type=router_type, node_id=node_id, options=options)
+    chids = []
+    for i in range(0, random.randint(1, 10)):
+        chids.append(register_channel(uaid, options))
+    return {"uaid": uaid, "chids": chids}
+
+def stress_test(options:Values):
+    ### let's see what we can abuse.
+    allchids = get_chids(".*", options)
+    for i in range(1, options.stress):
+        print(f"{i:>5} ##### ", end="")
+        # register a new uaid and some channels
+        uaid = random.choice(allchids).split('#')[0]
+        match random.randint(1,10):
+            case 1:  # new user
+                user = register(options)
+                allchids.extend(user.get("chids"))
+            case 2:  # connect, fetch messages, get list of chids, ack messages.
+                connect_uaid(uaid, options)
+                chids = get_chids(uaid, options)
+                for chid in chids:
+                    clear_chid(chid)
+            case 3:  # connect and register a new channel
+                connect_uaid(uaid, options)
+                allchids.append(register_channel(uaid, options))
+            case 4:  # drop a user
+                drop_all(uaid)
+                allchids = get_chids(".*", options)
+            case 5:  # drop a chid
+                drop_chid(random.choice(allchids))
+            case other:  # send a message.
+                create_message(random.choice(allchids), datetime.datetime.utcnow())
+
+def get_args():
+    parser = OptionParser()
+    parser.add_option("--populate", "-p", type=int, default=0, help="populate this many")
+    parser.add_option("--uaid", type=str, help="target uaid")
+    parser.add_option("--ack", type=str, help="ack a UAID#CHID")
+    parser.add_option("--process", action="store_true", default=False, help="process a UAID")
+    parser.add_option("--modify", "-m", action="store_true", default=False, help="modify")
+    parser.add_option("--sleep", "-s", type=int, default=0, help="max sleep seconds between modifications")
+    parser.add_option("--display", action="store_true", default=False, help="display uaid")
+    parser.add_option("--register", action="store_true", default=False, help="register some channels")
+    parser.add_option("--list_chids", action="store_true", default=False, help="Display a list of known CHIDs for a UAID")
+    parser.add_option("--list_uaids", action="store_true", default=False, help="Display a list of known UAIDs")
+    parser.add_option("--load", action="store_true", default=False, help="Load a UAID with fake messages")
+    parser.add_option("--dump", action="store_true", default=False, help="Dump a UAID")
+    parser.add_option("--drop", action="store_true", help="drop a UAID and all records")
+    parser.add_option("--skip_create", action="store_true", default=False, help="Don't create new UAIDs")
+    parser.add_option("--prune", action="store_true", default=False, help="Prune empty UAIDs")
+    parser.add_option("--stress", type=int, default=0, help="stress test bigtable")
+
+    return parser.parse_args()
+
+
 def main():
     (options, _args) = get_args()
     start = datetime.datetime.utcnow()
+
+    if options.stress:
+        stress_test(options)
+        return()
 
     if options.populate:
         uaids = populate(options)
         print(f"  UAIDS: {uaids}")
         print(f"Duration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.ack:
         clear_chid(options.ack)
         print(f"Duration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.process:
         process_uaid(target_uaid(options), options)
         print(f"Duration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.load:
         load_uaid(target_uaid(options), options)
         print(f"Duration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.drop:
         drop_all(target_uaid(options))
         print(f"Duration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.register:
         target = target_uaid(options)
         for i in range(1, random.randrange(1,10)):
             register_channel(target, options)
         print(f"Duration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.dump:
         uaids = get_uaids()
         for uaid in uaids:
             dump_uaid(uaid)
-        exit()
+        return()
 
     if options.list_uaids:
         uaids = get_uaids()
         print(f"  UAIDs: {uaids}\nDuration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.list_chids:
         chids = get_chids(target_uaid(options), options)
         print(f"  CHIDs: {chids}\nDuration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
 
     if options.display:
@@ -425,7 +493,7 @@ def main():
         dump_uaid(target)
         chids = get_chids(target, options)
         print(f"  CHIDS: {chids}:\nDuration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     if options.prune:
         uaids = get_uaids()
@@ -434,7 +502,7 @@ def main():
             if not chids:
                 drop_all(uaid)
         print(f"Duration {datetime.datetime.utcnow() - start}")
-        exit()
+        return()
 
     connect_uaid(target_uaid(options), options)
     print(f"Duration {datetime.datetime.utcnow() - start}")
