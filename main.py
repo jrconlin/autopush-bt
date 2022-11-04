@@ -12,11 +12,11 @@ import os
 import json
 import sys
 
-from typing import List;
+from typing import (Dict, List, Tuple);
 
 from optparse import (OptionParser, Values)
 from google.cloud import bigtable
-from google.cloud.bigtable import (column_family, row_filters, row_set, row)
+from google.cloud.bigtable import (column_family, row_filters, row_set, row, table)
 
 PROJECT_ID = "autopush-dev"
 INSTANCE_ID = "development-1"
@@ -35,9 +35,10 @@ def calc_ttl(now:datetime, ttl:int):
     return now + datetime.timedelta(seconds=ttl)
 
 
-def get_chids(uaid:str, options:Values):
+def get_chids(uaid:bytes, options:Values) -> List[bytes]:
     ### fetch the chids for the given UAID returns a set of uaid#chid
-    key = f"^{uaid}#.*"
+    key = f"^{uaid.decode()}#.*".encode()
+    print(key)
     all_rows = message.read_rows(filter_=row_filters.RowFilterChain(
         filters=[
             # get everything that matches the key regex (starts with uaid)
@@ -50,15 +51,15 @@ def get_chids(uaid:str, options:Values):
     # is there no way to get the count of rows without iterating?
     for row in all_rows:
         if not row.to_dict().get(f"{DEFAULT_FAMILY}:dead".encode()):
-            result.append(row.row_key.decode())
+            result.append(row.row_key)
     # BigTable loves to return duplicates.
     return list(set(result))
 
 
-def create_uaid(connected_at: datetime, router_type:str, node_id:str, options:Values) -> str:
+def create_uaid(connected_at: datetime, router_type:str, node_id:str, options:Values) -> bytes:
     ### create a base UAID, with no channels (mocking a `register`)
     now = datetime.datetime.utcnow()
-    uaid = uuid.uuid4().hex
+    uaid = uuid.uuid4().hex.encode()
 
     row = router.direct_row(uaid)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()), timestamp=now)
@@ -75,11 +76,11 @@ def create_uaid(connected_at: datetime, router_type:str, node_id:str, options:Va
         raise Exception(f"DIRECT COMMIT ERROR: {rr}")
     return uaid
 
-def register_channel(uaid: str, options:Values) -> str:
+def register_channel(uaid: bytes, options:Values) -> bytes:
     ### Mock registering a new channel.
     chid = uuid.uuid4().hex
     now = datetime.datetime.utcnow()
-    key = f"{uaid}#{chid}"
+    key = f"{uaid.decode()}#{chid}".encode()
 
     row = message.direct_row(key)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="created", value=int(now.timestamp()))
@@ -93,7 +94,7 @@ def register_channel(uaid: str, options:Values) -> str:
 
     return key
 
-def create_message(key:str, now:datetime):
+def create_message(key:bytes, now:datetime):
     ### create a fake message under a given uaid#chid
     data = base64.urlsafe_b64encode(os.urandom(random.randint(2048,4096)))
     # static/fake headers
@@ -105,7 +106,7 @@ def create_message(key:str, now:datetime):
     # give it some ttl (in seconds)
     ttl = calc_ttl(now, random.randint(60,10000))
     row = message.read_row(key)
-    if row.to_dict().get(f"{DEFAULT_FAMILY}:dead".encode()):
+    if row and row.to_dict().get(f"{DEFAULT_FAMILY}:dead".encode()):
         print(f"☠{key}:404")
 
     row = message.direct_row(key)
@@ -119,22 +120,42 @@ def create_message(key:str, now:datetime):
     if res.ListFields() != []:
         raise Exception(f"DIRECT COMMIT ERROR: {res}")
 
-def clear_chid(key: str):
+def clear_chid(key: bytes):
     ### delete all data for this uaid#chid, mocks an `ack`
-
     row = message.row(key)
-    row.delete_cells(column_family_id=MESSAGE_FAMILY, columns=["data", "headers"])
+    row.delete_cells(column_family_id=MESSAGE_FAMILY, columns=["sortkey_timestamp", "data", "headers"])
     print(f" Clearing {key}", end="")
     res = row.commit()
     print(f" ✔")
-
-
     # so, if things fail, `commit` doesn't throw an exception. Instead, the result value contains the error.
     if res.ListFields() != []:
         raise Exception(f"CONDITION COMMIT ERROR: {res}")
 
+def purge(table:table.Table, key:bytes):
+    ### if you delete all the columns from a row, bigtable will delete the row. This does not appear to be
+    ### rate limited.
+    ###
+    read_row = table.read_row(key.decode())
+    if not read_row or read_row.cells:
+        read_row = table.read_row(key)
+        if read_row is None or not read_row.cells:
+            print(f"\n    Empty row {table.name}::{key}", end="")
+            return
+    del_row = table.row(key)
+    # for each family, collect up the cells, and set them to delete.
+    for family in read_row.cells.keys():
+        columns = []
+        for cell in read_row.cells.get(family).keys():
+            columns.append(cell)
+        print(f" {family}:{columns}, ", end="")
+        del_row.delete_cells(column_family_id=family, columns=columns)
+    res = del_row.commit()
+    if res.ListFields():
+        import pdb;pdb.set_trace()
+        print(res)
 
-def process_uaid(uaid:str, options:Values):
+
+def process_uaid(uaid:bytes, options:Values):
     ### mock a message check.
     chids = get_chids(uaid, options)
     for chid in chids:
@@ -144,10 +165,13 @@ def process_uaid(uaid:str, options:Values):
             print(f"Skipping {chid}")
 
 
-def load_uaid(uaid:str, options:Values):
+def load_uaid(uaid:bytes, options:Values):
     ### generate a few random updates to deliver
-    chids = get_chids(uaid, options)
     now = datetime.datetime.utcnow()
+    chids = get_chids(uaid, options)
+    if not chids:
+        for i in range(0, random.randint(1, 10)):
+            chids.append(register_channel(uaid, options))
     for i in range(0, random.randrange(1,10)):
         create_message(random.choice(chids), now=now)
 
@@ -178,9 +202,9 @@ def populate(options:Values):
     return(uaids)
 
 
-def get_pending(target_uaid:str, options:Values):
+def get_pending(uaid:bytes, options:Values) -> List[Tuple[bytes, int]]:
     ### get the pending messages, well, message sizes.
-    filter = row_filters.RowKeyRegexFilter(f"^{target_uaid}#.*".encode("utf-8"))
+    filter = row_filters.RowKeyRegexFilter(f"^{uaid.decode()}#.*".encode("utf-8"))
     all_rows = message.read_rows(
         filter_=filter
     )
@@ -190,10 +214,10 @@ def get_pending(target_uaid:str, options:Values):
             if cols.get(b'dead'):
                 next
             for data in cols.get(b'data') or []:
-                results.append((row.row_key.decode(), len(data.value)))
+                results.append((row.row_key, len(data.value)))
     return results
 
-def connect_uaid(uaid:str, options:Values):
+def connect_uaid(uaid:bytes, options:Values):
     ### Pretend a UAID connected
     print(f"checking {uaid}", end="")
     node_id = "https://example.com:8082/" + uuid.uuid4().hex
@@ -298,15 +322,16 @@ def print_row(row:row.PartialRowData):
     print("")
 
 
-def dump_uaid(target_uaid):
-    ### Dump info for a target_uaid
+def dump_uaid(uaid:bytes):
+    ### Dump info for a target
     # show the router info
-    rrow = router.read_row(target_uaid)
+    rrow = router.read_row(uaid)
     print_row(rrow)
     # show the "messages" that might be for this UAID.
     # this appears to match only cells that have this value, regardless of column name.
     #filter = row_filters.ValueRangeFilter(start_value=int.to_bytes(int(datetime.datetime.utcnow().timestamp()), length=8, byteorder="big"))
-    filter = row_filters.RowKeyRegexFilter(f"^{target_uaid}#.*".encode("utf-8"))
+    uaid = f"{uaid.decode()}#.*".encode()
+    filter = row_filters.RowKeyRegexFilter(uaid)
     all_rows = message.read_rows(
         filter_=filter
     )
@@ -317,7 +342,7 @@ def dump_uaid(target_uaid):
         print_row(row)
 
 
-def get_uaids(limit: int=0):
+def get_uaids(limit: int=0) -> List[bytes]:
     ### fetch all the UAIDs we have. Including broken ones.
     # this is actually pretty expensive. It's a table scan.
     # StripValue... replaces the values with empty strings.
@@ -330,46 +355,34 @@ def get_uaids(limit: int=0):
     return result
 
 
-def drop_all(uaid):
+def drop_all(uaid:bytes, options:Values):
     ### drop this UAID and everything we know about it. (surprisingly expensive.)
     print(f"dropping {uaid}", end="")
     now = datetime.datetime.utcnow()
     # There's a limit on how many `drop_by_prefix` we can do.
-    router.drop_by_prefix(uaid)
-    message.drop_by_prefix(uaid)
-
-    """
-    # Sadly, this doesn't work. Quite.
-    # So, you can specify a different column_family_id, and that GC will be
-    # enforced, but it does not alter the column_families of the prior
-    # entries.
-    row = router.direct_row(uaid)
-    row.set_cell(column_family_id=MESSAGE_FAMILY, column="connected_at", value=int(now.timestamp()), timestamp=now)
-    row.set_cell(column_family_id=MESSAGE_FAMILY, column="router_type", value="", timestamp=now)
-    row.set_cell(column_family_id=MESSAGE_FAMILY, column="node_id", value="", timestamp=now)
-    row.commit()
-    """
+    # bonus! this is also very slow.
+    # router.drop_by_prefix(uaid)
+    # message.drop_by_prefix(uaid)
+    for chid in get_chids(uaid, options):
+        purge(message, chid)
+    purge(router, uaid)
     duration = datetime.datetime.utcnow() - now
     print(f" Duration {duration}")
     uaids = get_uaids()
     print(f" remaining: {uaids}")
 
-def drop_chid(key):
-    ### deletes are rate limited, so fake one by creating a "dead" record.
-    # TODO: Figure out how to prune these?
-    print(f"clearing chid {key}", end="")
-    row = message.direct_row(key)
-    now = datetime.datetime.utcnow()
-    row.set_cell(column_family_id=DEFAULT_FAMILY, column="dead", value=True, timestamp=now)
-    row.commit()
+def drop_chid(chid:bytes):
+    ### clean out a chid by purging it.
+    purge(message, chid)
     print("✔")
 
-def target_uaid(options:Values):
+
+def target_uaid(options:Values) -> bytes:
     ### return the `uaid` parameter, or just pick one at random.
-    return options.uaid or random.choice(get_uaids())
+    return options.uaid.encode() or random.choice(get_uaids())
 
 
-def register(options:Values):
+def register(options:Values) -> Dict:
     # register a UAID and add some random channels.
     now = datetime.datetime.utcnow()
     connected_at = now
@@ -383,26 +396,30 @@ def register(options:Values):
 
 def stress_test(options:Values):
     ### let's see what we can abuse.
-    allchids = get_chids(".*", options)
+    allchids = get_chids(".*".encode(), options)
     for i in range(1, options.stress):
         print(f"{i:>5} ##### ", end="")
         # register a new uaid and some channels
-        uaid = random.choice(allchids).split('#')[0]
+        if not allchids:
+            user = register(options)
+            allchids.extend(user.get("chids"))
+            continue
+        uaid = random.choice(allchids).decode().split('#')[0].encode()
         match random.randint(1,10):
             case 1:  # new user
                 user = register(options)
                 allchids.extend(user.get("chids"))
             case 2:  # connect, fetch messages, get list of chids, ack messages.
                 connect_uaid(uaid, options)
-                chids = get_chids(uaid, options)
-                for chid in chids:
+                chids_str = get_chids(uaid, options)
+                for chid in chids_str:
                     clear_chid(chid)
             case 3:  # connect and register a new channel
                 connect_uaid(uaid, options)
                 allchids.append(register_channel(uaid, options))
             case 4:  # drop a user
-                drop_all(uaid)
-                allchids = get_chids(".*", options)
+                drop_all(uaid, options)
+                allchids = get_chids(".*".encode(), options)
             case 5:  # drop a chid
                 drop_chid(random.choice(allchids))
             case other:  # send a message.
@@ -412,6 +429,8 @@ def get_args():
     parser = OptionParser()
     parser.add_option("--populate", "-p", type=int, default=0, help="populate this many")
     parser.add_option("--uaid", type=str, help="target uaid")
+    parser.add_option("--delete", type=str, help="Clear a key")
+    parser.add_option("--purge", action="store_true", default=False, help="burn it all...")
     parser.add_option("--ack", type=str, help="ack a UAID#CHID")
     parser.add_option("--process", action="store_true", default=False, help="process a UAID")
     parser.add_option("--modify", "-m", action="store_true", default=False, help="modify")
@@ -421,7 +440,7 @@ def get_args():
     parser.add_option("--list_chids", action="store_true", default=False, help="Display a list of known CHIDs for a UAID")
     parser.add_option("--list_uaids", action="store_true", default=False, help="Display a list of known UAIDs")
     parser.add_option("--load", action="store_true", default=False, help="Load a UAID with fake messages")
-    parser.add_option("--dump", action="store_true", default=False, help="Dump a UAID")
+    parser.add_option("--dump", action="store_true", default=False, help="Dump databases")
     parser.add_option("--drop", action="store_true", help="drop a UAID and all records")
     parser.add_option("--skip_create", action="store_true", default=False, help="Don't create new UAIDs")
     parser.add_option("--prune", action="store_true", default=False, help="Prune empty UAIDs")
@@ -443,6 +462,22 @@ def main():
         print(f"  UAIDS: {uaids}")
         print(f"Duration {datetime.datetime.utcnow() - start}")
         return()
+
+    if options.delete:
+        target = options.delete.encode()
+        print(f" deleting {options.delete} ", end="")
+        purge(message, target)
+        if '#' not in options.delete:
+            purge(router, target)
+        print ("")
+        return()
+
+    if options.purge:
+        print("Purging...")
+        for uaid in get_uaids():
+            print(f" Deleting {uaid} ", end="")
+            drop_all(uaid, options)
+            print ("")
 
     if options.ack:
         clear_chid(options.ack)
@@ -474,7 +509,7 @@ def main():
     if options.dump:
         uaids = get_uaids()
         for uaid in uaids:
-            dump_uaid(uaid)
+            dump_uaid(uaid.encode())
         return()
 
     if options.list_uaids:
@@ -500,11 +535,11 @@ def main():
         for uaid in uaids:
             chids = get_chids(uaid, options)
             if not chids:
-                drop_all(uaid)
+                drop_all(uaid, options)
         print(f"Duration {datetime.datetime.utcnow() - start}")
         return()
 
-    connect_uaid(target_uaid(options), options)
+    # connect_uaid(target_uaid(options), options)
     print(f"Duration {datetime.datetime.utcnow() - start}")
 
 main()
