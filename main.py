@@ -17,18 +17,20 @@ from typing import (Dict, List, Tuple);
 from optparse import (OptionParser, Values)
 from google.cloud import bigtable
 from google.cloud.bigtable import (column_family, row_filters, row_set, row, table)
+from google.cloud.bigtable.row_data import PartialRowsData
+
+# try loading everything in one table.
 
 PROJECT_ID = "autopush-dev"
 INSTANCE_ID = "development-1"
-DEFAULT_FAMILY = "default_family"
-MESSAGE_FAMILY = "message_family" # presumes expiry of 1s.
+DEFAULT_FAMILY = "default"
+ROUTER_FAMILY = "router"
+MESSAGE_FAMILY = "message" # presumes expiry of 1s.
 
 client = bigtable.Client(project=PROJECT_ID, admin=True)
 instance = client.instance(INSTANCE_ID)
 
-router = instance.table("router")
-message = instance.table("message")
-
+autopush = instance.table("autopush")
 
 def calc_ttl(now:datetime, ttl:int):
     ### convenience function for genering an integer TTL offset.
@@ -39,7 +41,7 @@ def get_chids(uaid:bytes, options:Values) -> List[bytes]:
     ### fetch the chids for the given UAID returns a set of uaid#chid
     key = f"^{uaid.decode()}#.*".encode()
     print(key)
-    all_rows = message.read_rows(filter_=row_filters.RowFilterChain(
+    all_rows = autopush.read_rows(filter_=row_filters.RowFilterChain(
         filters=[
             # get everything that matches the key regex (starts with uaid)
             row_filters.RowKeyRegexFilter(key),
@@ -61,12 +63,11 @@ def create_uaid(connected_at: datetime, router_type:str, node_id:str, options:Va
     now = datetime.datetime.utcnow()
     uaid = uuid.uuid4().hex.encode()
 
-    row = router.direct_row(uaid)
+    row = autopush.direct_row(uaid)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="connected_at", value=int(connected_at.timestamp()), timestamp=now)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="router_type", value=router_type, timestamp=now)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="node_id", value=node_id, timestamp=now)
     # not sure we need this if we use column family expiry rules.
-    # row.set_cell(column_family_id=DEFAULT_FAMILY, column="expiry", value=int(calc_ttl(now, 300).timestamp()), timestamp=now)
 
     print(f"Creating UAID: {uaid}", end="")
     rr = row.commit()
@@ -82,7 +83,7 @@ def register_channel(uaid: bytes, options:Values) -> bytes:
     now = datetime.datetime.utcnow()
     key = f"{uaid.decode()}#{chid}".encode()
 
-    row = message.direct_row(key)
+    row = autopush.direct_row(key)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="created", value=int(now.timestamp()))
     print("registering new channel ", end="")
     rr = row.commit()
@@ -105,11 +106,11 @@ def create_message(key:bytes, now:datetime):
     })
     # give it some ttl (in seconds)
     ttl = calc_ttl(now, random.randint(60,10000))
-    row = message.read_row(key)
+    row = autopush.read_row(key)
     if row and row.to_dict().get(f"{DEFAULT_FAMILY}:dead".encode()):
         print(f"☠{key}:404")
 
-    row = message.direct_row(key)
+    row = autopush.direct_row(key)
     row.set_cell(column_family_id=DEFAULT_FAMILY, column="sortkey_timestamp", value=int(now.timestamp()), timestamp=now)
     row.set_cell(column_family_id=MESSAGE_FAMILY, column="data", value=data, timestamp=ttl)
     row.set_cell(column_family_id=MESSAGE_FAMILY, column="headers", value=headers, timestamp=ttl)
@@ -122,7 +123,7 @@ def create_message(key:bytes, now:datetime):
 
 def clear_chid(key: bytes):
     ### delete all data for this uaid#chid, mocks an `ack`
-    row = message.row(key)
+    row = autopush.row(key)
     row.delete_cells(column_family_id=MESSAGE_FAMILY, columns=["sortkey_timestamp", "data", "headers"])
     print(f" Clearing {key}", end="")
     res = row.commit()
@@ -135,6 +136,7 @@ def purge(table:table.Table, key:bytes):
     ### if you delete all the columns from a row, bigtable will delete the row. This does not appear to be
     ### rate limited.
     ###
+    print(f" ❌ purging {key}, ")
     read_row = table.read_row(key.decode())
     if not read_row or read_row.cells:
         read_row = table.read_row(key)
@@ -205,7 +207,7 @@ def populate(options:Values):
 def get_pending(uaid:bytes, options:Values) -> List[Tuple[bytes, int]]:
     ### get the pending messages, well, message sizes.
     filter = row_filters.RowKeyRegexFilter(f"^{uaid.decode()}#.*".encode("utf-8"))
-    all_rows = message.read_rows(
+    all_rows = autopush.read_rows(
         filter_=filter
     )
     results = []
@@ -217,26 +219,31 @@ def get_pending(uaid:bytes, options:Values) -> List[Tuple[bytes, int]]:
                 results.append((row.row_key, len(data.value)))
     return results
 
+def get_cell(row:PartialRowsData, family: str, cell: str):
+    if not row or row.cells:
+        return None
+    if not row.cells.get(family):
+        return None
+    return row.cells.get(family).get(cell)
+
 def connect_uaid(uaid:bytes, options:Values):
     ### Pretend a UAID connected
     print(f"checking {uaid}", end="")
     node_id = "https://example.com:8082/" + uuid.uuid4().hex
     now = datetime.datetime.utcnow()
 
-    row = router.direct_row(uaid)
-    row.set_cell(
-        column_family_id=DEFAULT_FAMILY,
-        column="connected_at",
-        value=int(now.timestamp()).to_bytes(4, "big"),
-        timestamp=now
-    )
-    row.set_cell(
-        column_family_id=DEFAULT_FAMILY,
-        column="node_id",
-        value=node_id,
-        timestamp=now
-    )
-    rr = row.commit()
+    read_row = autopush.read_row(uaid)
+    if not read_row:
+        print(f"\n############### 404 {uaid}")
+        return
+    now = datetime.datetime.utcnow()
+    write_row = autopush.row(uaid)
+    write_row.set_cell(column_family_id="router", column="connected_at", value=int(now.timestamp()), timestamp=now)
+    write_row.set_cell(column_family_id="router", column="router_type", value=get_cell(read_row, "router", "router_type") or "", timestamp=now)
+    write_row.set_cell(column_family_id="router", column="router_data", value=get_cell(read_row, "router", "router_data") or "", timestamp=now)
+    write_row.set_cell(column_family_id="router", column="node_id", value=get_cell(read_row, "router", "node_id") or "", timestamp=now)
+    write_row.set_cell(column_family_id="router", column="record_version", value=get_cell(read_row, "router", "record_version") or "", timestamp=now)
+    rr = write_row.commit()
     print(f"✔")
 
     """
@@ -325,18 +332,18 @@ def print_row(row:row.PartialRowData):
 def dump_uaid(uaid:bytes):
     ### Dump info for a target
     # show the router info
-    rrow = router.read_row(uaid)
+    rrow = autopush.read_row(uaid)
     print_row(rrow)
     # show the "messages" that might be for this UAID.
     # this appears to match only cells that have this value, regardless of column name.
     #filter = row_filters.ValueRangeFilter(start_value=int.to_bytes(int(datetime.datetime.utcnow().timestamp()), length=8, byteorder="big"))
     uaid = f"{uaid.decode()}#.*".encode()
     filter = row_filters.RowKeyRegexFilter(uaid)
-    all_rows = message.read_rows(
+    all_rows = autopush.read_rows(
         filter_=filter
     )
     ## wasn't super sure may revisit this. Specifying the start/end key may limit scan.
-    # vv = router.read_rows(start_key="0", end_key="fffffffffffffffffffffff")
+    # vv = autopush.read_rows(start_key="0", end_key="fffffffffffffffffffffff")
     # print(vv)
     for row in all_rows:
         print_row(row)
@@ -348,7 +355,7 @@ def get_uaids(limit: int=0) -> List[bytes]:
     # StripValue... replaces the values with empty strings.
     # (If this is hadoop like, it still fetches them, it just strips before sending)
     filter = row_filters.StripValueTransformerFilter(True)
-    rows = router.read_rows(filter_=filter)
+    rows = autopush.read_rows(filter_=filter)
     result = [row.row_key for row in rows]
     if limit:
         return result[:limit]
@@ -357,15 +364,14 @@ def get_uaids(limit: int=0) -> List[bytes]:
 
 def drop_all(uaid:bytes, options:Values):
     ### drop this UAID and everything we know about it. (surprisingly expensive.)
-    print(f"dropping {uaid}", end="")
+    print(f"✖ dropping {uaid}")
     now = datetime.datetime.utcnow()
     # There's a limit on how many `drop_by_prefix` we can do.
     # bonus! this is also very slow.
-    # router.drop_by_prefix(uaid)
-    # message.drop_by_prefix(uaid)
+    # autopush.drop_by_prefix(uaid)
     for chid in get_chids(uaid, options):
-        purge(message, chid)
-    purge(router, uaid)
+        purge(autopush, chid)
+    purge(autopush, uaid)
     duration = datetime.datetime.utcnow() - now
     print(f" Duration {duration}")
     uaids = get_uaids()
@@ -373,7 +379,7 @@ def drop_all(uaid:bytes, options:Values):
 
 def drop_chid(chid:bytes):
     ### clean out a chid by purging it.
-    purge(message, chid)
+    purge(autopush, chid)
     print("✔")
 
 
@@ -451,7 +457,6 @@ def get_args():
 
 def main():
     (options, _args) = get_args()
-    start = datetime.datetime.utcnow()
 
     if options.stress:
         stress_test(options)
@@ -466,9 +471,9 @@ def main():
     if options.delete:
         target = options.delete.encode()
         print(f" deleting {options.delete} ", end="")
-        purge(message, target)
+        purge(autopush, target)
         if '#' not in options.delete:
-            purge(router, target)
+            purge(autopush, target)
         print ("")
         return()
 
@@ -540,6 +545,7 @@ def main():
         return()
 
     # connect_uaid(target_uaid(options), options)
-    print(f"Duration {datetime.datetime.utcnow() - start}")
 
+start = datetime.datetime.utcnow()
 main()
+print(f"Duration {datetime.datetime.utcnow() - start}")
