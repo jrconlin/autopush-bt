@@ -1,0 +1,37 @@
+[package]
+name = "autopush-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+futures = "0.3"
+hostname = "0.3"
+# ln -s to https://github.com/mozilla-services/google-cloud-rust/googleapis-raw branch "chore/update-2210"
+google-cloud-rust-raw={path="googleapis-raw"}
+grpcio = "0.12.0"
+# note: requires locked protobuf 2.28.0
+protobuf="2.28.0"
+hex = "0.4"
+log = {version = "0.4", features = [
+    "max_level_trace",
+    "release_max_level_info",
+]}
+rand = "0.8"
+serde = "1.0"
+serde_derive = "1.0"
+serde_json = { version = "1.0" }
+slog = { version = "2.5", features = [
+  "max_level_trace",
+  "release_max_level_info",
+  "dynamic-keys",
+] }
+slog-async = "2.5"
+slog-envlogger = "2.2.0"
+slog-mozlog-json = "0.1"
+slog-scope = "4.3"
+slog-stdlog = "4.1"
+slog-term = "2.6"
+time = "0.3"
+thiserror = "1.0"

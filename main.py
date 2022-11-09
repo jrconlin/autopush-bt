@@ -355,10 +355,8 @@ def get_uaids(limit: int=0) -> List[bytes]:
     # StripValue... replaces the values with empty strings.
     # (If this is hadoop like, it still fetches them, it just strips before sending)
     filter = row_filters.StripValueTransformerFilter(True)
-    rows = autopush.read_rows(filter_=filter)
+    rows = autopush.read_rows(filter_=filter, limit=limit)
     result = [row.row_key for row in rows]
-    if limit:
-        return result[:limit]
     return result
 
 
