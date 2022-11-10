@@ -14,6 +14,7 @@ mod btclient;
 mod logging;
 
 async fn async_main() {
+
     logging::init_logging(true);
     info!("starting");
     let table_name = env::var("DSN").unwrap_or_else(|_| {
@@ -40,7 +41,8 @@ async fn async_main() {
             // filter only rows that are UAIDs.
             let mut regx_filter = data::RowFilter::default();
             regx_filter.set_row_key_regex_filter("^[^#]+".as_bytes().to_vec());
-
+            regx_filter
+            /*
             // Build a chain for these filters.
             let mut chain = data::RowFilter_Chain::default();
             let mut repeat_field = RepeatedField::default();
@@ -52,6 +54,7 @@ async fn async_main() {
             let mut filter = data::RowFilter::default();
             filter.set_chain(chain);
             filter
+            */
         };
 
         // Build the Request, setting the table and including the specified rows.
@@ -81,12 +84,18 @@ async fn async_main() {
             if let Ok(row) = rrow {
                 print!("====");
                 for chunk in row.get_chunks() {
+
+                    // TODO: merge chunks into logical row.
+                    // (See row_merger._RowMerger.process_chunks)
                     if let Ok(key) = std::str::from_utf8(&chunk.row_key) {
                         if !key.is_empty() {
                             uaids.push(key.to_owned());
                         }
                         // we get back a lot more random chunks. Need to figure out how to stich them together?
                         // TODO: each additional cell is included in it's own chunk?
+                        // Yes, reading the chunks that form a row is a state machine.
+
+
                         dbg!(&chunk);
                     }
                 }
