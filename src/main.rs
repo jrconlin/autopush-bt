@@ -29,8 +29,7 @@ async fn async_main() {
 
     // TODO: throw these in a pool?
     let client = btclient::BigTableClient::new(env, creds, &endpoint, &table_name);
-
-    // TODO: method:
+    // build a Request (we'll go with a regex one first.)
     let req = {
         // TODO: method
         let filter = {
@@ -66,6 +65,9 @@ async fn async_main() {
     };
 
     // TODO: method
+    dbg!(client.read_rows(req).await);
+
+    /*
     let uaids = {
         // get uaids:
         // TODO: stuff this into a class
@@ -106,6 +108,7 @@ async fn async_main() {
     };
 
     dbg!(uaids);
+    */
 }
 
 fn main() {

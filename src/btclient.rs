@@ -1,14 +1,12 @@
-use std::sync::Arc;
+use std::{sync::Arc, hash::Hash};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use futures::StreamExt;
 use google_cloud_rust_raw::bigtable::v2::{
     bigtable::ReadRowsRequest, bigtable::{ReadRowsResponse, ReadRowsResponse_CellChunk}, bigtable_grpc::BigtableClient,
-    data::RowSet,
 };
-use grpcio::{ChannelBuilder, ChannelCredentials, Environment, ClientStreamingSink, ClientSStreamReceiver};
-use protobuf::RepeatedField;
+use grpcio::{ChannelBuilder, ChannelCredentials, Environment, ClientSStreamReceiver};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -102,7 +100,6 @@ pub(crate) struct PartialRow {
     last_qualifier: Option<Vec<u8>>,
     cell_in_progress: RefCell<PartialCell>,
 }
-
 
 #[derive(Debug, Default)]
 struct RowMerger{
@@ -289,19 +286,25 @@ impl RowMerger {
         Ok(self)
     }
 
-    async fn row_complete(&mut self, _chunk:ReadRowsResponse_CellChunk) -> Result<&Self, BigTableError> {
-        let mut new_row = PartialRow::default();
+    async fn row_complete(&mut self, _chunk:ReadRowsResponse_CellChunk) -> Result<Row, BigTableError> {
+        let mut new_row = Row::default();
 
         {
             let row = self.row_in_progress.borrow();
             self.last_seen_row_key = Some(row.row_key.clone());
             new_row.row_key = row.row_key.clone();
-            new_row.cells = row.cells.clone();
+            for (key, partial_cells) in row.cells.clone() {
+                let mut cells:Vec<Cell> = Vec::new();
+                for partial_cell in partial_cells {
+                    cells.push(partial_cell.into())
+                }
+                new_row.cells.insert(key, cells);
+            };
         }
 
         self.row_in_progress = RefCell::new(PartialRow::default());
         self.state = ReadState::RowStart;
-        Ok(self)
+        Ok(new_row)
     }
 
     async fn finalize(&mut self) -> Result<&Self, BigTableError>{
@@ -312,7 +315,11 @@ impl RowMerger {
     }
 
 
-    pub async fn process_chunks(&mut self, mut stream: ClientSStreamReceiver<ReadRowsResponse>) -> Result<(), BigTableError>{
+    pub async fn process_chunks(mut stream: ClientSStreamReceiver<ReadRowsResponse>) -> Result<HashMap::<Vec<u8>, Row>, BigTableError>{
+
+        let mut merger = Self::default();
+        let mut rows = HashMap::<Vec<u8>, Row>::new();
+
         while let (Some(row_resp_res), s) = stream.into_future().await {
             stream = s;
             let row = match row_resp_res {
@@ -328,31 +335,35 @@ impl RowMerger {
                 pub cached_size: ::protobuf::CachedSize,
             */
             if !row.last_scanned_row_key.is_empty() {
-                if self.last_seen_row_key.clone().unwrap_or_default() >= row.last_scanned_row_key {
+                if merger.last_seen_row_key.clone().unwrap_or_default() >= row.last_scanned_row_key {
                     return Err(BigTableError::InvalidChunk("Last scanned row key is out of order".to_owned()))
                 }
-                self.last_seen_row_key = Some(row.last_scanned_row_key)
+                merger.last_seen_row_key = Some(row.last_scanned_row_key)
             }
 
             for chunk in row.chunks {
                 if chunk.get_reset_row(){
-                    self.reset_row(chunk).await?;
+                    merger.reset_row(chunk).await?;
                     continue;
                 }
 
-                if chunk.has_commit_row() && self.state != ReadState::RowComplete {
+                if chunk.has_commit_row() && merger.state != ReadState::RowComplete {
                     return Err(BigTableError::InvalidChunk("Chunk tried to commit row in wrong state".to_owned()));
                 }
-                match self.state {
-                    ReadState::RowStart => self.row_start(chunk).await?,
-                    ReadState::CellStart => self.cell_start(chunk).await?,
-                    ReadState::CellInProgress => self.cell_in_progress(chunk).await?,
-                    ReadState::CellComplete => self.cell_complete(chunk).await?,
-                    ReadState::RowComplete => self.row_complete(chunk).await?,
+                match merger.state {
+                    ReadState::RowStart => merger.row_start(chunk).await?,
+                    ReadState::CellStart => merger.cell_start(chunk).await?,
+                    ReadState::CellInProgress => merger.cell_in_progress(chunk).await?,
+                    ReadState::CellComplete => merger.cell_complete(chunk).await?,
+                    ReadState::RowComplete => {
+                        let finished_row = merger.row_complete(chunk).await?;
+                        rows.insert(finished_row.row_key.clone(), finished_row);
+                        &merger
+                    },
                 };
             }
         }
-        Ok(())
+        Ok(rows)
     }
 }
 
@@ -381,8 +392,8 @@ impl BigTableClient {
         }
     }
 
-    pub async fn read_rows(self, key: &str) -> Result<Vec<ReadRowsResponse>, String> {
-        // set the list of keys to search. This can be a range, or a vector of keys.
+    pub async fn read_rows(self, req: ReadRowsRequest) -> Result<HashMap<Vec<u8>, Row>, String> {
+        /*
         let mut rep_field = RepeatedField::default();
         rep_field.push(key.as_bytes().to_vec());
         let mut row_set = RowSet::default();
@@ -392,17 +403,23 @@ impl BigTableClient {
         let mut req = ReadRowsRequest::default();
         req.set_table_name(self.table_name);
         req.set_rows(row_set);
-
+        */
         // gather ye results.
-        let mut rows = Vec::new();
+        // let mut rows = Vec::new();
 
-        let mut stream = self.client.read_rows(&req).map_err(|e| e.to_string())?;
+        let stream = self.client.read_rows(&req).map_err(|e| e.to_string())?;
+        /*
         while let (Some(rrow), s) = stream.into_future().await {
             stream = s;
             if let Ok(row) = rrow {
                 rows.push(row);
             }
         }
-        Ok(rows)
+        */
+
+        let result = RowMerger::process_chunks(stream).await.map_err(|e| e.to_string())?;
+        dbg!(&result);
+
+        Ok(result)
     }
 }
