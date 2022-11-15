@@ -16,7 +16,7 @@ protobuf="2.28.0"
 hex = "0.4"
 log = {version = "0.4", features = [
     "max_level_trace",
-    "release_max_level_info",
+    "release_max_level_trace",
 ]}
 rand = "0.8"
 serde = "1.0"

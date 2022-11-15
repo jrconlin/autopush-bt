@@ -14,8 +14,7 @@ mod btclient;
 mod logging;
 
 async fn async_main() {
-
-    logging::init_logging(true);
+    logging::init_logging(false);
     info!("starting");
     let table_name = env::var("DSN").unwrap_or_else(|_| {
         "projects/autopush-dev/instances/development-1/tables/autopush".to_owned()
@@ -65,7 +64,11 @@ async fn async_main() {
     };
 
     // TODO: method
-    dbg!(client.read_rows(req).await);
+    let result = client.read_rows(req).await.unwrap();
+    for key in result.keys() {
+        println!("🚣🏻‍♂️    {:?} => {:?}", key, result.get(key).unwrap());
+    }
+    println!("");
 
     /*
     let uaids = {
