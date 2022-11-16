@@ -1,17 +1,108 @@
-use std::{env, sync::Arc};
+use std::collections::HashMap;
+use std::{
+    env,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use btclient::{BigTableClient, BigTableError};
 use futures::executor::block_on;
-use futures::stream::StreamExt;
 use grpcio::{ChannelCredentials, EnvBuilder};
 
 use google_cloud_rust_raw::bigtable::v2::{bigtable, data};
 use protobuf::RepeatedField;
+use rand::{seq::SliceRandom, Rng};
+
+use crate::btclient::{fill_cells, Cell, Qualifier, Row};
 
 #[macro_use]
 extern crate slog_scope;
 
 mod btclient;
 mod logging;
+
+async fn get_uaids(client: &BigTableClient) -> Result<Vec<String>, BigTableError> {
+    // build a Request (we'll go with a regex one first.)
+    let req = {
+        // TODO: method
+        let filter = {
+            // if we only want key values, we don't realy care about the cells.
+            // this will strip those values from the returned rows, making the
+            // response a bit faster.
+            let mut strip_filter = data::RowFilter::default();
+            strip_filter.set_strip_value_transformer(true);
+
+            /*
+            // you can also specify a set, which limits fetched data to just
+            // items between two keys.
+            let mut range_set = data::RowRange::default();
+
+            // Range keys are either open (meaning that they do not include
+            // the provided key) or closed (meaning that they do include the
+            // provided key). It would be most common to have an open start
+            // key and a closed end key.
+            range_set.set_start_key_open(start_key_bytes);
+            range_set.set_end_key_closed(end_key_bytes);
+            */
+
+            // regex filters are pretty much what's on the tin. They use
+            // regular expression syntax to search data. Ideally, these are
+            // scoped to a limited set of keys (using the key range). We're doing
+            // a semi expensive table scan here.
+            let mut regex_filter = data::RowFilter::default();
+            regex_filter.set_row_key_regex_filter("^[^#]+".as_bytes().to_vec());
+
+            // Build a chain for these filters.
+            // BigTable first gathers all the row data then applies the
+            // specified filters. With a `RowFilter_Chain` the product of
+            // one filter feeds into the next.
+            // `RowFilter_Condition`
+
+            let mut chain = data::RowFilter_Chain::default();
+            let mut repeat_field = RepeatedField::default();
+            repeat_field.push(strip_filter);
+            repeat_field.push(regex_filter);
+            chain.set_filters(repeat_field);
+
+            // and store them into a single filter.
+            let mut filter = data::RowFilter::default();
+            filter.set_chain(chain);
+            filter
+        };
+
+        // Build the Request, setting the table and including the specified rows.
+        // in this case, we're going to get all the UAIDs (all keys that do not
+        // include the `#` separator.
+        let mut req = bigtable::ReadRowsRequest::default();
+        req.set_table_name(client.table_name.clone());
+        req.set_filter(filter);
+        // req.set_rows(row_set);
+        req
+    };
+
+    // Get the filtered data and return just the row_keys
+    // yes, don't do this in production.
+    Ok(client
+        .clone()
+        .read_rows(req)
+        .await?
+        .keys()
+        .map(|v| v.to_owned())
+        .collect::<Vec<String>>())
+}
+
+async fn target_uaid(client: &BigTableClient) -> Result<String, BigTableError> {
+    match env::var("UAID") {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let uaid = get_uaids(&client)
+                .await?
+                .choose(&mut rand::thread_rng())
+                .map(|v| v.to_owned());
+            Ok(uaid.unwrap_or_else(|| "".to_owned()))
+        }
+    }
+}
 
 async fn async_main() {
     logging::init_logging(false);
@@ -29,89 +120,71 @@ async fn async_main() {
     // TODO: throw these in a pool?
     let client = btclient::BigTableClient::new(env, creds, &endpoint, &table_name);
     // build a Request (we'll go with a regex one first.)
-    let req = {
-        // TODO: method
-        let filter = {
-            // build a value stripping filter:
-            let mut strip_filter = data::RowFilter::default();
-            strip_filter.set_strip_value_transformer(true);
 
-            // filter only rows that are UAIDs.
-            let mut regx_filter = data::RowFilter::default();
-            regx_filter.set_row_key_regex_filter("^[^#]+".as_bytes().to_vec());
-            regx_filter
-            /*
-            // Build a chain for these filters.
-            let mut chain = data::RowFilter_Chain::default();
-            let mut repeat_field = RepeatedField::default();
-            repeat_field.push(strip_filter);
-            repeat_field.push(regx_filter);
-            chain.set_filters(repeat_field);
+    // Randomly pick a UAID
+    let uaid = target_uaid(&client).await.unwrap();
+    debug!("Picked UAID {:?}", &uaid);
 
-            // and store them into a single filter.
-            let mut filter = data::RowFilter::default();
-            filter.set_chain(chain);
-            filter
-            */
-        };
+    // Add some data:
+    // for the UAID:
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let now_ms = now.as_micros();
+    let mut cell_data: HashMap<Qualifier, Vec<u8>> = HashMap::new();
+    cell_data.insert("connected_at".into(), now_ms.to_be_bytes().to_vec());
+    cell_data.insert(
+        "node_id".into(),
+        format!("https://some.node/r/{}", rand::random::<u64>()).into(),
+    );
 
-        // Build the Request, setting the table and including the specified rows.
-        let mut req = bigtable::ReadRowsRequest::default();
-        req.set_table_name(table_name);
-        req.set_filter(filter);
-        // req.set_rows(row_set);
-        req
+    // use the same family in this function as the row you're adding.
+    let mut cells: HashMap<Qualifier, Vec<Cell>> = HashMap::new();
+    // We only have one family here, so we just do this once.
+    cells.insert("default".into(), fill_cells("default", now_ms, cell_data));
+    let row = Row {
+        row_key: uaid.clone().into(),
+        cells,
     };
+    client.clone().write_row(row).await.unwrap();
+    debug!("Wrote UAID connection.");
 
-    // TODO: method
-    let result = client.read_rows(req).await.unwrap();
-    for key in result.keys() {
-        println!("🚣🏻‍♂️    {:?} => {:?}", key, result.get(key).unwrap());
-    }
-    println!("");
+    // Let's make up some channel data to show how that works.
+    let chid = uuid::Uuid::new_v4().as_simple().to_string();
+    debug!("Adding CHID: {}", &chid);
 
-    /*
-    let uaids = {
-        // get uaids:
-        // TODO: stuff this into a class
-        let mut stream = match client.client.read_rows(&req).map_err(|e| e.to_string()) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("{}", e);
-                return;
-            }
-        };
+    let ttl = (SystemTime::now()
+        + time::Duration::seconds(rand::thread_rng().gen_range(60..10000)))
+    .duration_since(UNIX_EPOCH)
+    .unwrap();
 
-        let mut uaids = Vec::new();
+    let data_len = rand::thread_rng().gen_range(2048..4096);
+    let data = base64::encode_config(
+        (0..data_len)
+            .map(|_| rand::random::<u8>())
+            .collect::<Vec<u8>>(),
+        base64::URL_SAFE_NO_PAD,
+    );
 
-        while let (Some(rrow), s) = stream.into_future().await {
-            stream = s;
-            if let Ok(row) = rrow {
-                print!("====");
-                for chunk in row.get_chunks() {
+    // And write the cells.
+    let mut cells: HashMap<Qualifier, Vec<Cell>> = HashMap::new();
+    let mut cell_data: HashMap<Qualifier, Vec<u8>> = HashMap::new();
+    cell_data.insert("data".into(), data.into_bytes());
+    cell_data.insert(
+        "sortkey_timestamp".into(),
+        now.as_secs().to_be_bytes().to_vec(),
+    );
+    cell_data.insert("headers".into(), "header, header, header".to_owned().into());
+    cells.insert(
+        "message".into(),
+        fill_cells("message", ttl.as_micros(), cell_data),
+    );
 
-                    // TODO: merge chunks into logical row.
-                    // (See row_merger._RowMerger.process_chunks)
-                    if let Ok(key) = std::str::from_utf8(&chunk.row_key) {
-                        if !key.is_empty() {
-                            uaids.push(key.to_owned());
-                        }
-                        // we get back a lot more random chunks. Need to figure out how to stich them together?
-                        // TODO: each additional cell is included in it's own chunk?
-                        // Yes, reading the chunks that form a row is a state machine.
-
-
-                        dbg!(&chunk);
-                    }
-                }
-                // rows.push(row.chunks.);
-            }
-        }
-        uaids
+    let row = Row {
+        row_key: format!("{}#{}", &uaid, &chid).into(),
+        cells,
     };
+    client.write_row(row).await.unwrap();
 
-    dbg!(uaids);
-    */
+    // TODO: Get the newly created data by polling the UAID.
 }
 
 fn main() {

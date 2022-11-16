@@ -4,6 +4,8 @@ use std::fmt;
 use std::{hash::Hash, sync::Arc};
 
 use futures::StreamExt;
+use google_cloud_rust_raw::bigtable::v2::bigtable::MutateRowRequest;
+use google_cloud_rust_raw::bigtable::v2::data::{Family, Mutation, Mutation_SetCell};
 use google_cloud_rust_raw::bigtable::v2::{
     bigtable::ReadRowsRequest,
     bigtable::{ReadRowsResponse, ReadRowsResponse_CellChunk},
@@ -14,8 +16,8 @@ use protobuf::well_known_types::StringValue;
 use thiserror::Error;
 
 // these are normally Vec<u8>
-type RowKey = String;
-type Qualifier = String;
+pub type RowKey = String;
+pub type Qualifier = String;
 
 #[derive(Debug, Error)]
 pub enum BigTableError {
@@ -33,8 +35,16 @@ pub enum BigTableError {
 
     #[error("Invalid Chunk: {0}")]
     InvalidChunk(String),
+
+    #[error("BigTable read error {0}")]
+    BigTableRead(String),
+
+    #[error("BigTable write error {0}")]
+    BigTableWrite(String),
 }
 
+/// List of the potential states when we are reading each value from the
+/// returned stream and composing a "row"
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum ReadState {
     RowStart,
@@ -50,6 +60,7 @@ impl Default for ReadState {
     }
 }
 
+/*
 pub struct Chunk {
     family: Option<String>,
     value: Vec<u8>,
@@ -57,17 +68,22 @@ pub struct Chunk {
     qualifier: Option<String>,
     state: ReadState,
 }
+*/
 
+/// An in-progress Cell data struct.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PartialCell {
     family: String,
     qualifier: Qualifier,
-    timestamp_ms: i64,
+    timestamp_ms: u128,
     labels: Vec<String>,
     value: Vec<u8>,
     value_index: usize,
 }
 
+/// A finished Cell. An individual Cell contains the
+/// data. There can be multiple cells for a given
+/// rowkey::qualifier.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct Cell {
     family: String,
@@ -75,8 +91,8 @@ pub struct Cell {
     value: Vec<u8>,
     value_len: usize,
     value_index: usize,
-    timestamp_ms: i64,
-    labels: Vec<String>,
+    timestamp_ms: u128,
+    labels: Vec<String>, // not sure if these are used?
 }
 
 impl From<PartialCell> for Cell {
@@ -93,15 +109,43 @@ impl From<PartialCell> for Cell {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct Row {
-    row_key: RowKey,
-    cells: HashMap<String, Vec<Cell>>,
+/// Returns a list of filled cells for the given family.
+/// NOTE: Timestamp, here, means whatever the family GC rules dictate.
+pub fn fill_cells(
+    family: &str,
+    timestamp_ms: u128,
+    cell_data: HashMap<Qualifier, Vec<u8>>,
+) -> Vec<Cell> {
+    let mut cells: Vec<Cell> = Vec::new();
+    let mut value_index = 0;
+    for (qualifier, value) in cell_data {
+        cells.push(Cell {
+            family: family.to_owned(),
+            qualifier,
+            timestamp_ms,
+            value,
+            value_index,
+            ..Default::default()
+        });
+        value_index += 1;
+    }
+    cells
 }
 
+/// A finished row. A row consists of a hash of one or more cells per
+/// qualifer (cell name).
+#[derive(Debug, Default, Clone)]
+pub struct Row {
+    pub row_key: RowKey,
+    pub cells: HashMap<Qualifier, Vec<Cell>>,
+}
+
+/// An in-progress Row structure
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PartialRow {
+    /// table uniquie key
     row_key: RowKey,
+    /// map of cells per family identifier.
     cells: HashMap<String, Vec<PartialCell>>,
     last_family: String,
     last_family_cells: HashMap<Qualifier, Vec<Cell>>,
@@ -109,6 +153,7 @@ pub(crate) struct PartialRow {
     cell_in_progress: RefCell<PartialCell>,
 }
 
+/// workhorse struct, this is used to gather item data from the stream and build rows.
 #[derive(Debug, Default)]
 struct RowMerger {
     state: ReadState,
@@ -117,8 +162,8 @@ struct RowMerger {
     row_in_progress: RefCell<PartialRow>, // TODO: Make Option?
 }
 
-//
 impl RowMerger {
+    /// discard data so far and return to a neutral state.
     async fn reset_row(
         &mut self,
         chunk: ReadRowsResponse_CellChunk,
@@ -237,7 +282,7 @@ impl RowMerger {
         // record the timestamp for this cell. (Note: this is not the clock time that it was
         // created, but the timestamp that was used for it's creation. It is used by the
         // garbage collector.)
-        cell.timestamp_ms = chunk.timestamp_micros;
+        cell.timestamp_ms = chunk.timestamp_micros as u128;
 
         // If there are additional labels for this cell, record them.
         // can't call map, so do this the semi-hard way
@@ -490,8 +535,10 @@ impl RowMerger {
     }
 }
 
+#[derive(Clone)]
+/// Wrapper for the BigTable connection
 pub struct BigTableClient {
-    table_name: String,
+    pub(crate) table_name: String,
     pub(crate) client: BigtableClient,
 }
 
@@ -514,33 +561,50 @@ impl BigTableClient {
         }
     }
 
-    pub async fn read_rows(self, req: ReadRowsRequest) -> Result<HashMap<RowKey, Row>, String> {
-        /*
-        let mut rep_field = RepeatedField::default();
-        rep_field.push(key.as_bytes().to_vec());
-        let mut row_set = RowSet::default();
-        row_set.set_row_keys(rep_field);
+    /// Take a big table ReadRowsRequest (containing the keys and filters) and return a set of row data.
+    ///
+    ///
+    pub async fn read_rows(
+        self,
+        req: ReadRowsRequest,
+    ) -> Result<HashMap<RowKey, Row>, BigTableError> {
+        let stream = self
+            .client
+            .read_rows(&req)
+            .map_err(|e| BigTableError::BigTableRead(e.to_string()))?;
+        Ok(RowMerger::process_chunks(stream).await?)
+    }
 
-        // Build the Request, setting the table and including the specified rows.
-        let mut req = ReadRowsRequest::default();
-        req.set_table_name(self.table_name);
-        req.set_rows(row_set);
-        */
-        // gather ye results.
-        // let mut rows = Vec::new();
+    /// write a given row.
+    ///
+    /// there's also `.mutate_rows` which I presume allows multiple.
+    pub async fn write_row(self, row: Row) -> Result<(), BigTableError> {
+        let mut req = MutateRowRequest::default();
 
-        let stream = self.client.read_rows(&req).map_err(|e| e.to_string())?;
-        /*
-        while let (Some(rrow), s) = stream.into_future().await {
-            stream = s;
-            if let Ok(row) = rrow {
-                rows.push(row);
+        // compile the mutations.
+        // It's possible to do a lot here, including altering in process
+        // mutations, clearing them, etc. It's all up for grabs until we commit
+        // below. For now, let's just presume a write and be done.
+        let mut mutations = protobuf::RepeatedField::default();
+        req.set_row_key(row.row_key.into_bytes());
+        for (_family, cells) in row.cells {
+            for cell in cells {
+                let mut mutation = Mutation::default();
+                let mut set_cell = Mutation_SetCell::default();
+                set_cell.family_name = cell.family;
+                set_cell.set_column_qualifier(cell.qualifier.into_bytes());
+                set_cell.set_value(cell.value);
+                set_cell.set_timestamp_micros(cell.timestamp_ms as i64);
+                mutation.set_set_cell(set_cell);
+                mutations.push(mutation);
             }
         }
-        */
+        req.set_mutations(mutations);
 
-        Ok(RowMerger::process_chunks(stream)
-            .await
-            .map_err(|e| e.to_string())?)
+        // Do the actual commit.
+        self.client
+            .mutate_row(&req)
+            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
+        Ok(())
     }
 }

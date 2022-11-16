@@ -6,6 +6,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+base64 = "0.13"
 futures = "0.3"
 hostname = "0.3"
 # ln -s to https://github.com/mozilla-services/google-cloud-rust/googleapis-raw branch "chore/update-2210"
@@ -35,3 +36,4 @@ slog-stdlog = "4.1"
 slog-term = "2.6"
 time = "0.3"
 thiserror = "1.0"
+uuid = {version = "1.2", features=["v4"]}
