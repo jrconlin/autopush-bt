@@ -123,7 +123,7 @@ async fn async_main() {
 
     // Randomly pick a UAID
     let uaid = target_uaid(&client).await.unwrap();
-    debug!("Picked UAID {:?}", &uaid);
+    info!("⛏ Picked UAID {:?}", &uaid);
 
     // Add some data:
     // for the UAID:
@@ -144,30 +144,34 @@ async fn async_main() {
         row_key: uaid.clone().into(),
         cells,
     };
-    client.clone().write_row(row).await.unwrap();
-    debug!("Wrote UAID connection.");
+    client.write_row(row).await.unwrap();
+    info!("Wrote UAID connection.");
 
     // Let's make up some channel data to show how that works.
     let chid = uuid::Uuid::new_v4().as_simple().to_string();
-    debug!("Adding CHID: {}", &chid);
+    info!("Adding CHID: {}", &chid);
 
     let ttl = (SystemTime::now()
         + time::Duration::seconds(rand::thread_rng().gen_range(60..10000)))
     .duration_since(UNIX_EPOCH)
     .unwrap();
 
+    // Written data is automagically converted to base64 when stored.
+    // You will need to decode it on the way out.
+    /*
     let data_len = rand::thread_rng().gen_range(2048..4096);
-    let data = base64::encode_config(
+    let data =
         (0..data_len)
             .map(|_| rand::random::<u8>())
-            .collect::<Vec<u8>>(),
-        base64::URL_SAFE_NO_PAD,
-    );
+            .collect::<Vec<u8>>();
+    */
 
+    let data = "Amidst the mists and coldest frosts, I thrust my fists against the posts and still demand to see the ghosts".to_owned().into_bytes();
+    let data_len = data.len();
     // And write the cells.
     let mut cells: HashMap<Qualifier, Vec<Cell>> = HashMap::new();
     let mut cell_data: HashMap<Qualifier, Vec<u8>> = HashMap::new();
-    cell_data.insert("data".into(), data.into_bytes());
+    cell_data.insert("data".into(), data);
     cell_data.insert(
         "sortkey_timestamp".into(),
         now.as_secs().to_be_bytes().to_vec(),
@@ -175,14 +179,37 @@ async fn async_main() {
     cell_data.insert("headers".into(), "header, header, header".to_owned().into());
     cells.insert(
         "message".into(),
-        fill_cells("message", ttl.as_micros(), cell_data),
+        fill_cells("message", ttl.as_secs() as u128, cell_data),
     );
 
+    let chid_row = format!("{}#{}", &uaid, &chid);
+
     let row = Row {
-        row_key: format!("{}#{}", &uaid, &chid).into(),
+        row_key: chid_row.clone().into(),
         cells,
     };
+    info!(
+        "📝 writing row {:?}, Data len: {}, timestamp: {}",
+        &chid_row,
+        data_len,
+        ttl.as_secs()
+    );
     client.write_row(row).await.unwrap();
+
+    // std::thread::sleep(std::time::Duration::from_secs(5));
+    info!("  Reading row {:?}", &chid_row);
+    if let Some(row) = client.read_row(&chid_row).await.unwrap() {
+        println!(
+            "
+Row: {}
+Data: {:?}
+",
+            row.row_key,
+            String::from_utf8(row.get("message", "data").unwrap().pop().unwrap().value).unwrap()
+        )
+    };
+
+    info!("🛑 Done");
 
     // TODO: Get the newly created data by polling the UAID.
 }

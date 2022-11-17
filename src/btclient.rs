@@ -1,23 +1,24 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt;
-use std::{hash::Hash, sync::Arc};
+use std::sync::Arc;
 
 use futures::StreamExt;
-use google_cloud_rust_raw::bigtable::v2::bigtable::MutateRowRequest;
-use google_cloud_rust_raw::bigtable::v2::data::{Family, Mutation, Mutation_SetCell};
+use google_cloud_rust_raw::bigtable::v2::bigtable;
+use google_cloud_rust_raw::bigtable::v2::data;
 use google_cloud_rust_raw::bigtable::v2::{
     bigtable::ReadRowsRequest,
     bigtable::{ReadRowsResponse, ReadRowsResponse_CellChunk},
     bigtable_grpc::BigtableClient,
 };
-use grpcio::{ChannelBuilder, ChannelCredentials, ClientSStreamReceiver, Environment};
-use protobuf::well_known_types::StringValue;
+use grpcio::{Channel, ChannelBuilder, ChannelCredentials, ClientSStreamReceiver, Environment};
+use protobuf::RepeatedField;
 use thiserror::Error;
 
 // these are normally Vec<u8>
 pub type RowKey = String;
 pub type Qualifier = String;
+// This must be a String.
+pub type FamilyId = String;
 
 #[derive(Debug, Error)]
 pub enum BigTableError {
@@ -60,20 +61,10 @@ impl Default for ReadState {
     }
 }
 
-/*
-pub struct Chunk {
-    family: Option<String>,
-    value: Vec<u8>,
-    timestamp_ms: Option<u64>,
-    qualifier: Option<String>,
-    state: ReadState,
-}
-*/
-
 /// An in-progress Cell data struct.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PartialCell {
-    family: String,
+    family: FamilyId,
     qualifier: Qualifier,
     timestamp_ms: u128,
     labels: Vec<String>,
@@ -86,12 +77,18 @@ pub(crate) struct PartialCell {
 /// rowkey::qualifier.
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
 pub struct Cell {
-    family: String,
-    qualifier: Qualifier,
-    value: Vec<u8>,
-    value_len: usize,
+    /// The family identifier string.
+    pub family: FamilyId,
+    /// Column name
+    pub qualifier: Qualifier,
+    /// Column data
+    pub value: Vec<u8>,
+    /// the cell's index if returned in a group or array.
     value_index: usize,
-    timestamp_ms: u128,
+    /// "Timestamp" in seconds. This value is used by the family garbage collection rules.
+    // this is supposed to be microseconds, but I regularly get an error response from BigTable of:
+    // `Timestamp granularity mismatch. Expected a multiple of 1000 (millisecond granularity), but got nnnnn`
+    pub timestamp: u128,
     labels: Vec<String>, // not sure if these are used?
 }
 
@@ -100,10 +97,9 @@ impl From<PartialCell> for Cell {
         Self {
             family: partial.family,
             qualifier: partial.qualifier,
-            value_len: partial.value.len(),
             value: partial.value,
             value_index: partial.value_index,
-            timestamp_ms: partial.timestamp_ms,
+            timestamp: partial.timestamp_ms,
             labels: partial.labels,
         }
     }
@@ -113,7 +109,7 @@ impl From<PartialCell> for Cell {
 /// NOTE: Timestamp, here, means whatever the family GC rules dictate.
 pub fn fill_cells(
     family: &str,
-    timestamp_ms: u128,
+    timestamp: u128,
     cell_data: HashMap<Qualifier, Vec<u8>>,
 ) -> Vec<Cell> {
     let mut cells: Vec<Cell> = Vec::new();
@@ -122,7 +118,7 @@ pub fn fill_cells(
         cells.push(Cell {
             family: family.to_owned(),
             qualifier,
-            timestamp_ms,
+            timestamp: (timestamp * 1000),
             value,
             value_index,
             ..Default::default()
@@ -136,8 +132,29 @@ pub fn fill_cells(
 /// qualifer (cell name).
 #[derive(Debug, Default, Clone)]
 pub struct Row {
+    /// The row's key.
+    // This may be any ByteArray value.
     pub row_key: RowKey,
+    /// The row's collection of cells, indexed by the family ID.
     pub cells: HashMap<Qualifier, Vec<Cell>>,
+}
+
+impl Row {
+    pub fn get(&self, family: &str, column: &str) -> Option<Vec<Cell>> {
+        let mut result = Vec::<Cell>::new();
+        if let Some(family_group) = self.cells.get(family) {
+            for cell in family_group {
+                if cell.qualifier == column {
+                    result.push(cell.clone())
+                }
+            }
+        }
+        if !result.is_empty() {
+            Some(result)
+        } else {
+            None
+        }
+    }
 }
 
 /// An in-progress Row structure
@@ -146,9 +163,9 @@ pub(crate) struct PartialRow {
     /// table uniquie key
     row_key: RowKey,
     /// map of cells per family identifier.
-    cells: HashMap<String, Vec<PartialCell>>,
-    last_family: String,
-    last_family_cells: HashMap<Qualifier, Vec<Cell>>,
+    cells: HashMap<FamilyId, Vec<PartialCell>>,
+    last_family: FamilyId,
+    last_family_cells: HashMap<FamilyId, Vec<Cell>>,
     last_qualifier: Qualifier,
     cell_in_progress: RefCell<PartialCell>,
 }
@@ -158,7 +175,7 @@ pub(crate) struct PartialRow {
 struct RowMerger {
     state: ReadState,
     last_seen_row_key: Option<RowKey>,
-    last_seen_cell_family: Option<String>,
+    last_seen_cell_family: Option<FamilyId>,
     row_in_progress: RefCell<PartialRow>, // TODO: Make Option?
 }
 
@@ -219,7 +236,11 @@ impl RowMerger {
             ));
         }
         if chunk.has_family_name() {
-            info!("👪Family name: {:?}", &chunk.get_family_name());
+            info!(
+                "👪Family name: {}: {:?}",
+                String::from_utf8(chunk.row_key.clone()).unwrap_or_default(),
+                &chunk.get_family_name()
+            );
             self.last_seen_cell_family = Some(chunk.get_family_name().get_value().to_owned());
         }
         if let Some(last_key) = self.last_seen_row_key.clone() {
@@ -277,7 +298,7 @@ impl RowMerger {
         }
 
         // A qualifier is the name of the cell. (I don't know why it's called that either.)
-        cell.qualifier = String::from_utf8(qualifier).unwrap_or_default();
+        cell.qualifier = String::from_utf8(qualifier.clone()).unwrap_or_default();
 
         // record the timestamp for this cell. (Note: this is not the clock time that it was
         // created, but the timestamp that was used for it's creation. It is used by the
@@ -297,8 +318,16 @@ impl RowMerger {
             cell.value = Vec::with_capacity(chunk.value_size as usize);
             self.state = ReadState::CellInProgress;
         } else {
-            // Add the data to what we've got.
             cell.value.append(&mut chunk.value.clone());
+            // Add the data to what we've got.
+            /*
+            if qualifier != "data".to_owned().as_bytes() {
+                cell.value.append(&mut chunk.value.clone());
+            } else {
+                let mut converted =base64::decode_config(chunk.value.clone(), base64::URL_SAFE_NO_PAD).map_err(|e| BigTableError::BigTableRead(e.to_string()))?;
+                cell.value.append(&mut converted);
+            }
+            */
             self.state = ReadState::CellComplete;
         }
 
@@ -398,7 +427,7 @@ impl RowMerger {
             let mut qualifier_cells = Vec::new();
             qualifier_cells.push(Cell {
                 family: cell_family.clone(),
-                timestamp_ms: cell_in_progress.timestamp_ms,
+                timestamp: cell_in_progress.timestamp_ms,
                 labels: cell_in_progress.labels.clone(),
                 ..Default::default()
             });
@@ -503,7 +532,6 @@ impl RowMerger {
                     debug!("🟧 new row");
                     merger.row_start(&mut chunk).await?;
                 }
-
                 if merger.state == ReadState::CellStart {
                     debug!("🟡   cell start {:?}", chunk.get_qualifier());
                     merger.cell_start(&mut chunk).await?;
@@ -531,6 +559,7 @@ impl RowMerger {
                 debug!("🧩 Chunk end {:?}", merger.state);
             }
         }
+        debug!("🚣🏻‍♂️ Rows: {}", &rows.len());
         Ok(rows)
     }
 }
@@ -539,7 +568,8 @@ impl RowMerger {
 /// Wrapper for the BigTable connection
 pub struct BigTableClient {
     pub(crate) table_name: String,
-    pub(crate) client: BigtableClient,
+    chan: Channel,
+    client: BigtableClient,
 }
 
 impl BigTableClient {
@@ -557,44 +587,69 @@ impl BigTableClient {
 
         Self {
             table_name: table_name.to_owned(),
-            client: BigtableClient::new(chan),
+            client: BigtableClient::new(chan.clone()),
+            chan,
         }
+    }
+
+    pub async fn read_row(&self, row_key: &str) -> Result<Option<Row>, BigTableError> {
+        debug!("Row key: {}", row_key);
+
+        let mut row_keys = RepeatedField::default();
+        row_keys.push(row_key.to_owned().as_bytes().to_vec());
+
+        let mut row_set = data::RowSet::default();
+        row_set.set_row_keys(row_keys);
+
+        let mut req = bigtable::ReadRowsRequest::default();
+        req.set_table_name(self.table_name.clone());
+        req.set_rows(row_set);
+
+        let stream = self
+            .client
+            .read_rows(&req)
+            .map_err(|e| BigTableError::BigTableRead(e.to_string()))?;
+
+        let rows = RowMerger::process_chunks(stream).await?;
+        Ok(rows.get(row_key).cloned())
     }
 
     /// Take a big table ReadRowsRequest (containing the keys and filters) and return a set of row data.
     ///
     ///
     pub async fn read_rows(
-        self,
+        &self,
         req: ReadRowsRequest,
     ) -> Result<HashMap<RowKey, Row>, BigTableError> {
-        let stream = self
+        let resp = self
             .client
+            .clone()
             .read_rows(&req)
             .map_err(|e| BigTableError::BigTableRead(e.to_string()))?;
-        Ok(RowMerger::process_chunks(stream).await?)
+        Ok(RowMerger::process_chunks(resp).await?)
     }
 
     /// write a given row.
     ///
     /// there's also `.mutate_rows` which I presume allows multiple.
-    pub async fn write_row(self, row: Row) -> Result<(), BigTableError> {
-        let mut req = MutateRowRequest::default();
+    pub async fn write_row(&self, row: Row) -> Result<(), BigTableError> {
+        let mut req = bigtable::MutateRowRequest::default();
 
         // compile the mutations.
         // It's possible to do a lot here, including altering in process
         // mutations, clearing them, etc. It's all up for grabs until we commit
         // below. For now, let's just presume a write and be done.
         let mut mutations = protobuf::RepeatedField::default();
+        req.set_table_name(self.table_name.clone());
         req.set_row_key(row.row_key.into_bytes());
         for (_family, cells) in row.cells {
             for cell in cells {
-                let mut mutation = Mutation::default();
-                let mut set_cell = Mutation_SetCell::default();
+                let mut mutation = data::Mutation::default();
+                let mut set_cell = data::Mutation_SetCell::default();
                 set_cell.family_name = cell.family;
                 set_cell.set_column_qualifier(cell.qualifier.into_bytes());
                 set_cell.set_value(cell.value);
-                set_cell.set_timestamp_micros(cell.timestamp_ms as i64);
+                set_cell.set_timestamp_micros((cell.timestamp * 1000) as i64);
                 mutation.set_set_cell(set_cell);
                 mutations.push(mutation);
             }
@@ -602,8 +657,68 @@ impl BigTableClient {
         req.set_mutations(mutations);
 
         // Do the actual commit.
-        self.client
-            .mutate_row(&req)
+        // fails with `cannot execute `LocalPool` executor from within another executor: EnterError`
+        let _resp = self
+            .client
+            .mutate_row_async(&req)
+            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?
+            .await
+            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete all cell data from the specified columns with the optional time range.
+    pub async fn delete_cells(
+        &self,
+        row_key: &str,
+        family: &str,
+        column_names: &Vec<Vec<u8>>,
+        time_range: Option<&data::TimestampRange>,
+    ) -> Result<(), BigTableError> {
+        let mut req = bigtable::MutateRowRequest::default();
+        let mut mutations = protobuf::RepeatedField::default();
+        req.set_row_key(row_key.to_owned().into_bytes());
+        for column in column_names {
+            let mut mutation = data::Mutation::default();
+            // Mutation_DeleteFromRow -- Delete all cells for a given row.
+            // Mutation_DeleteFromFamily -- Delete all cells from a family for a given row.
+            // Mutation_DeleteFromColumn -- Delete all cells from a column name for a given row, restricted by timestamp range.
+            let mut del_cell = data::Mutation_DeleteFromColumn::default();
+            del_cell.set_family_name(family.to_owned());
+            del_cell.set_column_qualifier(column.to_owned());
+            if let Some(range) = time_range {
+                del_cell.set_time_range(range.clone());
+            }
+            mutation.set_delete_from_column(del_cell);
+            mutations.push(mutation);
+        }
+
+        req.set_mutations(mutations);
+
+        let _resp = self
+            .client
+            .mutate_row_async(&req)
+            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?
+            .await
+            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete all the cells for the given row. NOTE: This will drop the row.
+    pub async fn delete_row(&self, row_key: &str) -> Result<(), BigTableError> {
+        let mut req = bigtable::MutateRowRequest::default();
+        let mut mutations = protobuf::RepeatedField::default();
+        req.set_row_key(row_key.to_owned().into_bytes());
+        let mut mutation = data::Mutation::default();
+        mutation.set_delete_from_row(data::Mutation_DeleteFromRow::default());
+        mutations.push(mutation);
+        req.set_mutations(mutations);
+
+        let _resp = self
+            .client
+            .mutate_row_async(&req)
+            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?
+            .await
             .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
         Ok(())
     }

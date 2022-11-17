@@ -2,7 +2,7 @@ use std::io;
 
 // use crate::error::ApiResult;
 
-use slog::{self, slog_o, Drain};
+use slog::{self, slog_o, Drain, Logger};
 use slog_mozlog_json::MozLogJson;
 
 pub fn init_logging(json: bool) {
