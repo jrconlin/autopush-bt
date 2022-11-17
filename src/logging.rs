@@ -2,7 +2,7 @@ use std::io;
 
 // use crate::error::ApiResult;
 
-use slog::{self, slog_o, Drain, Logger};
+use slog::{self, slog_o, Drain};
 use slog_mozlog_json::MozLogJson;
 
 pub fn init_logging(json: bool) {
@@ -40,6 +40,7 @@ pub fn init_logging(json: bool) {
     slog_stdlog::init().ok();
 }
 
+#[allow(dead_code)]
 pub fn reset_logging() {
     let logger = slog::Logger::root(slog::Discard, slog_o!());
     slog_scope::set_global_logger(logger).cancel_reset();

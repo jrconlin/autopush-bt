@@ -1,9 +1,5 @@
 use std::collections::HashMap;
-use std::{
-    env,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{env, sync::Arc, time::SystemTime};
 
 use btclient::{BigTableClient, BigTableError};
 use futures::executor::block_on;
@@ -21,6 +17,7 @@ extern crate slog_scope;
 mod btclient;
 mod logging;
 
+#[allow(dead_code)]
 async fn get_uaids(client: &BigTableClient) -> Result<Vec<String>, BigTableError> {
     // build a Request (we'll go with a regex one first.)
     let req = {
@@ -91,11 +88,12 @@ async fn get_uaids(client: &BigTableClient) -> Result<Vec<String>, BigTableError
         .collect::<Vec<String>>())
 }
 
+#[allow(dead_code)]
 async fn target_uaid(client: &BigTableClient) -> Result<String, BigTableError> {
     match env::var("UAID") {
         Ok(v) => Ok(v),
-        Err(e) => {
-            let uaid = get_uaids(&client)
+        Err(_e) => {
+            let uaid = get_uaids(client)
                 .await?
                 .choose(&mut rand::thread_rng())
                 .map(|v| v.to_owned());
@@ -122,15 +120,31 @@ async fn async_main() {
     // build a Request (we'll go with a regex one first.)
 
     // Randomly pick a UAID
-    let uaid = target_uaid(&client).await.unwrap();
-    info!("⛏ Picked UAID {:?}", &uaid);
 
-    // Add some data:
-    // for the UAID:
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-    let now_ms = now.as_micros();
+    // let uaid = target_uaid(&client).await.unwrap();
+    let uaid = uuid::Uuid::new_v4().as_simple().to_string();
+    info!("⛏ Picked UAID {:?}", &uaid);
+    // Add some data for the UAID:
+
+    // Timestamps are a bit weird in BigTable.
+    // the "timestamp" field is basically a numeric that's compared to the system clock
+    // to determine what action to take. (e.g. if BigTable's garbage collection rules
+    // for a given family say that this cell should live for 1ms, it's not uncommon to
+    // have the timestamp be set into the future so that at timestamp+1ms, the record is
+    // removed.)
+    // In addition, when writing timestamp values, Bigtable seems to want timestamps
+    // rounded to the second. (otherwise you get "Timestamp granularity mismatch" errors)
+    let now = SystemTime::now();
+    let u_now = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
     let mut cell_data: HashMap<Qualifier, Vec<u8>> = HashMap::new();
-    cell_data.insert("connected_at".into(), now_ms.to_be_bytes().to_vec());
+
+    // this value can have ms granularity, since we're storing it as pure data.
+    cell_data.insert(
+        "connected_at".into(),
+        u_now.as_micros().to_be_bytes().to_vec(),
+    );
     cell_data.insert(
         "node_id".into(),
         format!("https://some.node/r/{}", rand::random::<u64>()).into(),
@@ -139,9 +153,13 @@ async fn async_main() {
     // use the same family in this function as the row you're adding.
     let mut cells: HashMap<Qualifier, Vec<Cell>> = HashMap::new();
     // We only have one family here, so we just do this once.
-    cells.insert("default".into(), fill_cells("default", now_ms, cell_data));
+    cells.insert(
+        "default".into(),
+        // note that this convenience function takes a second bound timestamp.
+        fill_cells("default", SystemTime::now(), cell_data),
+    );
     let row = Row {
-        row_key: uaid.clone().into(),
+        row_key: uaid.clone(),
         cells,
     };
     client.write_row(row).await.unwrap();
@@ -151,63 +169,81 @@ async fn async_main() {
     let chid = uuid::Uuid::new_v4().as_simple().to_string();
     info!("Adding CHID: {}", &chid);
 
-    let ttl = (SystemTime::now()
-        + time::Duration::seconds(rand::thread_rng().gen_range(60..10000)))
-    .duration_since(UNIX_EPOCH)
-    .unwrap();
-
-    // Written data is automagically converted to base64 when stored.
-    // You will need to decode it on the way out.
-    /*
-    let data_len = rand::thread_rng().gen_range(2048..4096);
-    let data =
-        (0..data_len)
-            .map(|_| rand::random::<u8>())
-            .collect::<Vec<u8>>();
-    */
+    let ttl = SystemTime::now() + time::Duration::seconds(rand::thread_rng().gen_range(60..10000));
 
     let data = "Amidst the mists and coldest frosts, I thrust my fists against the posts and still demand to see the ghosts".to_owned().into_bytes();
     let data_len = data.len();
+
     // And write the cells.
     let mut cells: HashMap<Qualifier, Vec<Cell>> = HashMap::new();
     let mut cell_data: HashMap<Qualifier, Vec<u8>> = HashMap::new();
-    cell_data.insert("data".into(), data);
+    cell_data.insert("data".into(), data.clone());
     cell_data.insert(
         "sortkey_timestamp".into(),
-        now.as_secs().to_be_bytes().to_vec(),
+        u_now.as_secs().to_be_bytes().to_vec(),
     );
     cell_data.insert("headers".into(), "header, header, header".to_owned().into());
-    cells.insert(
-        "message".into(),
-        fill_cells("message", ttl.as_secs() as u128, cell_data),
-    );
+    cells.insert("message".into(), fill_cells("message", ttl, cell_data));
 
-    let chid_row = format!("{}#{}", &uaid, &chid);
+    let chid_row_key = format!("{}#{}", &uaid, &chid);
 
     let row = Row {
-        row_key: chid_row.clone().into(),
+        row_key: chid_row_key.clone(),
         cells,
     };
     info!(
-        "📝 writing row {:?}, Data len: {}, timestamp: {}",
-        &chid_row,
-        data_len,
-        ttl.as_secs()
+        "📝 writing row {:?}, Data len: {}, timestamp: {:?}",
+        &chid_row_key, data_len, ttl
     );
     client.write_row(row).await.unwrap();
 
     // std::thread::sleep(std::time::Duration::from_secs(5));
-    info!("  Reading row {:?}", &chid_row);
-    if let Some(row) = client.read_row(&chid_row).await.unwrap() {
-        println!(
-            "
-Row: {}
-Data: {:?}
-",
-            row.row_key,
-            String::from_utf8(row.get("message", "data").unwrap().pop().unwrap().value).unwrap()
-        )
+    info!("  Reading row {:?}", &chid_row_key);
+    match client.read_row(&chid_row_key).await.unwrap() {
+        Some(read_row) => {
+            let row_data = read_row
+                .get_cells("message", "data")
+                .unwrap()
+                .pop()
+                .unwrap()
+                .value;
+            assert_eq!(row_data, data);
+            print!(
+                "\tRow: {}\n\tData: {:?}\n",
+                &chid_row_key,
+                String::from_utf8(row_data).unwrap()
+            )
+        }
+        None => {
+            error!("🚨Could not find row!");
+        }
     };
+
+    // deleting the data (an ack)
+    info!(" Acking data");
+    client
+        .delete_cells(
+            &chid_row_key,
+            "message",
+            &["data".to_owned().as_bytes().to_vec()].to_vec(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    match client.read_row(&chid_row_key).await.unwrap() {
+        Some(read_row) => {
+            if read_row.get_cells("message", "data").is_some() {
+                error!("🚨 Data not deleted")
+            }
+        }
+        None => {
+            info!("Row not found!");
+        }
+    };
+
+    info!(" Unregistering");
+    client.delete_row(&chid_row_key).await.unwrap();
 
     info!("🛑 Done");
 
