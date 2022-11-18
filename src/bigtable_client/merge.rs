@@ -1,40 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
-use google_cloud_rust_raw::bigtable::v2::bigtable;
-use google_cloud_rust_raw::bigtable::v2::data;
-use google_cloud_rust_raw::bigtable::v2::{
-    bigtable::ReadRowsRequest,
-    bigtable::{ReadRowsResponse, ReadRowsResponse_CellChunk},
-    bigtable_grpc::BigtableClient,
-};
-use grpcio::{ChannelBuilder, ChannelCredentials, ClientSStreamReceiver, Environment};
-use protobuf::RepeatedField;
-use thiserror::Error;
+use google_cloud_rust_raw::bigtable::v2::bigtable::{ReadRowsResponse, ReadRowsResponse_CellChunk};
+use grpcio::ClientSStreamReceiver;
 
-// these are normally Vec<u8>
-pub type RowKey = String;
-pub type Qualifier = String;
-// This must be a String.
-pub type FamilyId = String;
-
-#[derive(Debug, Error)]
-pub enum BigTableError {
-    #[error("Invalid Row Response: {0}")]
-    InvalidRowResponse(String),
-
-    #[error("Invalid Chunk: {0}")]
-    InvalidChunk(String),
-
-    #[error("BigTable read error {0}")]
-    BigTableRead(String),
-
-    #[error("BigTable write error {0}")]
-    BigTableWrite(String),
-}
+use super::{cell::Cell, error::BigTableError, row::Row, FamilyId, Qualifier, RowKey};
 
 /// List of the potential states when we are reading each value from the
 /// returned stream and composing a "row"
@@ -56,19 +28,19 @@ impl Default for ReadState {
 /// An in-progress Cell data struct.
 #[derive(Debug, Clone)]
 pub(crate) struct PartialCell {
-    family: FamilyId,
+    pub(crate) family: FamilyId,
     /// A "qualifier" is a column name
-    qualifier: Qualifier,
+    pub(crate) qualifier: Qualifier,
     /// Timestamps are returned as microseconds, but need to be
     /// specified as milliseconds (even though the function asks
     /// for microseconds, you * 1000 the mls).
-    timestamp: SystemTime,
+    pub(crate) timestamp: SystemTime,
     /// Not sure if or how these are used
-    labels: Vec<String>,
+    pub(crate) labels: Vec<String>,
     /// The data buffer.
-    value: Vec<u8>,
+    pub(crate) value: Vec<u8>,
     /// the returned sort order for the cell.
-    value_index: usize,
+    pub(crate) value_index: usize,
 }
 
 impl Default for PartialCell {
@@ -80,101 +52,6 @@ impl Default for PartialCell {
             labels: Vec::new(),
             value: Vec::new(),
             value_index: 0,
-        }
-    }
-}
-
-/// A finished Cell. An individual Cell contains the
-/// data. There can be multiple cells for a given
-/// rowkey::qualifier.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct Cell {
-    /// The family identifier string.
-    pub family: FamilyId,
-    /// Column name
-    pub qualifier: Qualifier,
-    /// Column data
-    pub value: Vec<u8>,
-    /// the cell's index if returned in a group or array.
-    value_index: usize,
-    /// "Timestamp" in milliseconds. This value is used by the family
-    /// garbage collection rules and may not reflect reality.
-    pub timestamp: SystemTime,
-    labels: Vec<String>, // not sure if these are used?
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            family: String::default(),
-            qualifier: String::default(),
-            timestamp: SystemTime::now(),
-            labels: Vec::new(),
-            value: Vec::new(),
-            value_index: 0,
-        }
-    }
-}
-
-impl From<PartialCell> for Cell {
-    fn from(partial: PartialCell) -> Cell {
-        Self {
-            family: partial.family,
-            qualifier: partial.qualifier,
-            value: partial.value,
-            value_index: partial.value_index,
-            timestamp: partial.timestamp,
-            labels: partial.labels,
-        }
-    }
-}
-
-/// Returns a list of filled cells for the given family.
-/// NOTE: Timestamp, here, means whatever the family GC rules dictate.
-pub fn fill_cells(
-    family: &str,
-    timestamp: SystemTime,
-    cell_data: HashMap<Qualifier, Vec<u8>>,
-) -> Vec<Cell> {
-    let mut cells: Vec<Cell> = Vec::new();
-    for (value_index, (qualifier, value)) in cell_data.into_iter().enumerate() {
-        cells.push(Cell {
-            family: family.to_owned(),
-            qualifier,
-            timestamp,
-            value,
-            value_index,
-            ..Default::default()
-        });
-    }
-    cells
-}
-
-/// A finished row. A row consists of a hash of one or more cells per
-/// qualifer (cell name).
-#[derive(Debug, Default, Clone)]
-pub struct Row {
-    /// The row's key.
-    // This may be any ByteArray value.
-    pub row_key: RowKey,
-    /// The row's collection of cells, indexed by the family ID.
-    pub cells: HashMap<Qualifier, Vec<Cell>>,
-}
-
-impl Row {
-    pub fn get_cells(&self, family: &str, column: &str) -> Option<Vec<Cell>> {
-        let mut result = Vec::<Cell>::new();
-        if let Some(family_group) = self.cells.get(family) {
-            for cell in family_group {
-                if cell.qualifier == column {
-                    result.push(cell.clone())
-                }
-            }
-        }
-        if !result.is_empty() {
-            Some(result)
-        } else {
-            None
         }
     }
 }
@@ -200,7 +77,7 @@ pub(crate) struct PartialRow {
 
 /// workhorse struct, this is used to gather item data from the stream and build rows.
 #[derive(Debug, Default)]
-struct RowMerger {
+pub struct RowMerger {
     /// The row's current state. State progresses while processing a single chunk.
     state: ReadState,
     /// The last row key we've encountered. This should be consistent across the chunks.
@@ -591,169 +468,5 @@ impl RowMerger {
         merger.finalize().await?;
         debug!("🚣🏻‍♂️ Rows: {}", &rows.len());
         Ok(rows)
-    }
-}
-
-#[derive(Clone)]
-/// Wrapper for the BigTable connection
-pub struct BigTableClient {
-    /// The name of the table. This is used when generating a request.
-    pub(crate) table_name: String,
-    /// The client connection to BigTable.
-    client: BigtableClient,
-}
-
-impl BigTableClient {
-    pub fn new(
-        env: Arc<Environment>,
-        creds: ChannelCredentials,
-        endpoint: &str,
-        table_name: &str,
-    ) -> Self {
-        let chan = ChannelBuilder::new(env)
-            .max_send_message_len(1 << 28)
-            .max_receive_message_len(1 << 28)
-            .set_credentials(creds)
-            .connect(endpoint);
-
-        Self {
-            table_name: table_name.to_owned(),
-            client: BigtableClient::new(chan),
-        }
-    }
-
-    /// Read a given row from the row key.
-    pub async fn read_row(&self, row_key: &str) -> Result<Option<Row>, BigTableError> {
-        debug!("Row key: {}", row_key);
-
-        let mut row_keys = RepeatedField::default();
-        row_keys.push(row_key.to_owned().as_bytes().to_vec());
-
-        let mut row_set = data::RowSet::default();
-        row_set.set_row_keys(row_keys);
-
-        let mut req = bigtable::ReadRowsRequest::default();
-        req.set_table_name(self.table_name.clone());
-        req.set_rows(row_set);
-
-        let rows = self.read_rows(req).await?;
-        Ok(rows.get(row_key).cloned())
-    }
-
-    /// Take a big table ReadRowsRequest (containing the keys and filters) and return a set of row data.
-    ///
-    ///
-    pub async fn read_rows(
-        &self,
-        req: ReadRowsRequest,
-    ) -> Result<HashMap<RowKey, Row>, BigTableError> {
-        let resp = self
-            .client
-            .clone()
-            .read_rows(&req)
-            .map_err(|e| BigTableError::BigTableRead(e.to_string()))?;
-        RowMerger::process_chunks(resp).await
-    }
-
-    /// write a given row.
-    ///
-    /// there's also `.mutate_rows` which I presume allows multiple.
-    pub async fn write_row(&self, row: Row) -> Result<(), BigTableError> {
-        let mut req = bigtable::MutateRowRequest::default();
-
-        // compile the mutations.
-        // It's possible to do a lot here, including altering in process
-        // mutations, clearing them, etc. It's all up for grabs until we commit
-        // below. For now, let's just presume a write and be done.
-        let mut mutations = protobuf::RepeatedField::default();
-        req.set_table_name(self.table_name.clone());
-        req.set_row_key(row.row_key.into_bytes());
-        for (_family, cells) in row.cells {
-            for cell in cells {
-                let mut mutation = data::Mutation::default();
-                let mut set_cell = data::Mutation_SetCell::default();
-                let timestamp = cell
-                    .timestamp
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
-                set_cell.family_name = cell.family;
-                set_cell.set_column_qualifier(cell.qualifier.into_bytes());
-                set_cell.set_value(cell.value);
-                // Yes, this is passing milli bounded time as a micro. Otherwise I get
-                // a `Timestamp granularity mismatch` error
-                set_cell.set_timestamp_micros((timestamp.as_millis() * 1000) as i64);
-                mutation.set_set_cell(set_cell);
-                mutations.push(mutation);
-            }
-        }
-        req.set_mutations(mutations);
-
-        // Do the actual commit.
-        // fails with `cannot execute `LocalPool` executor from within another executor: EnterError`
-        let _resp = self
-            .client
-            .mutate_row_async(&req)
-            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?
-            .await
-            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Delete all cell data from the specified columns with the optional time range.
-    pub async fn delete_cells(
-        &self,
-        row_key: &str,
-        family: &str,
-        column_names: &Vec<Vec<u8>>,
-        time_range: Option<&data::TimestampRange>,
-    ) -> Result<(), BigTableError> {
-        let mut req = bigtable::MutateRowRequest::default();
-        req.set_table_name(self.table_name.clone());
-        let mut mutations = protobuf::RepeatedField::default();
-        req.set_row_key(row_key.to_owned().into_bytes());
-        for column in column_names {
-            let mut mutation = data::Mutation::default();
-            // Mutation_DeleteFromRow -- Delete all cells for a given row.
-            // Mutation_DeleteFromFamily -- Delete all cells from a family for a given row.
-            // Mutation_DeleteFromColumn -- Delete all cells from a column name for a given row, restricted by timestamp range.
-            let mut del_cell = data::Mutation_DeleteFromColumn::default();
-            del_cell.set_family_name(family.to_owned());
-            del_cell.set_column_qualifier(column.to_owned());
-            if let Some(range) = time_range {
-                del_cell.set_time_range(range.clone());
-            }
-            mutation.set_delete_from_column(del_cell);
-            mutations.push(mutation);
-        }
-
-        req.set_mutations(mutations);
-
-        let _resp = self
-            .client
-            .mutate_row_async(&req)
-            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?
-            .await
-            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Delete all the cells for the given row. NOTE: This will drop the row.
-    pub async fn delete_row(&self, row_key: &str) -> Result<(), BigTableError> {
-        let mut req = bigtable::MutateRowRequest::default();
-        req.set_table_name(self.table_name.clone());
-        let mut mutations = protobuf::RepeatedField::default();
-        req.set_row_key(row_key.to_owned().into_bytes());
-        let mut mutation = data::Mutation::default();
-        mutation.set_delete_from_row(data::Mutation_DeleteFromRow::default());
-        mutations.push(mutation);
-        req.set_mutations(mutations);
-
-        let _resp = self
-            .client
-            .mutate_row_async(&req)
-            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?
-            .await
-            .map_err(|e| BigTableError::BigTableWrite(e.to_string()))?;
-        Ok(())
     }
 }
