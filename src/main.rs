@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::{env, sync::Arc, time::SystemTime};
 
-use btclient::{BigTableClient, BigTableError};
+use bigtable_client::{error::BigTableError, BigTableClient};
 use futures::executor::block_on;
 use grpcio::{ChannelCredentials, EnvBuilder};
 
@@ -9,15 +9,16 @@ use google_cloud_rust_raw::bigtable::v2::{bigtable, data};
 use protobuf::RepeatedField;
 use rand::{seq::SliceRandom, Rng};
 
-use crate::btclient::{fill_cells, Cell, Qualifier, Row};
+use crate::bigtable_client::{cell::fill_cells, cell::Cell, row::Row, Qualifier};
 
 #[macro_use]
 extern crate slog_scope;
 
-mod btclient;
+mod bigtable_client;
 mod logging;
 
 #[allow(dead_code)]
+/// This is a demo showing how to construct a complex request.
 async fn get_uaids(client: &BigTableClient) -> Result<Vec<String>, BigTableError> {
     // build a Request (we'll go with a regex one first.)
     let req = {
@@ -89,6 +90,7 @@ async fn get_uaids(client: &BigTableClient) -> Result<Vec<String>, BigTableError
 }
 
 #[allow(dead_code)]
+/// allow for either a env specified ID or randomly pick an existing one.
 async fn target_uaid(client: &BigTableClient) -> Result<String, BigTableError> {
     match env::var("UAID") {
         Ok(v) => Ok(v),
@@ -116,13 +118,13 @@ async fn async_main() {
     let creds = ChannelCredentials::google_default_credentials().unwrap();
 
     // TODO: throw these in a pool?
-    let client = btclient::BigTableClient::new(env, creds, &endpoint, &table_name);
+    let client = bigtable_client::BigTableClient::new(env, creds, &endpoint, &table_name);
     // build a Request (we'll go with a regex one first.)
 
     // Randomly pick a UAID
-
     // let uaid = target_uaid(&client).await.unwrap();
     let uaid = uuid::Uuid::new_v4().as_simple().to_string();
+
     info!("⛏ Picked UAID {:?}", &uaid);
     // Add some data for the UAID:
 
