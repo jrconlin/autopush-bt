@@ -10,7 +10,8 @@ base64 = "0.13"
 futures = "0.3"
 hostname = "0.3"
 # ln -s to https://github.com/mozilla-services/google-cloud-rust/googleapis-raw branch "chore/update-2210"
-google-cloud-rust-raw={path="googleapis-raw"}
+#google-cloud-rust-raw={path="googleapis-raw"}
+google-cloud-rust-raw="0.14"
 grpcio = "0.12.0"
 # note: requires locked protobuf 2.28.0
 protobuf="2.28.0"
