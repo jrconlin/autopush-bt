@@ -396,6 +396,8 @@ impl RowMerger {
     /// Iterate through all the returned chunks and compile them into finished cells.
     pub async fn process_chunks(
         mut stream: ClientSStreamReceiver<ReadRowsResponse>,
+        timestamp_filter: Option<u64>,
+        _limit: Option<u64>,
     ) -> Result<HashMap<RowKey, Row>, BigTableError> {
         // Work object
         let mut merger = Self::default();
@@ -454,7 +456,23 @@ impl RowMerger {
                 if merger.state == ReadState::RowComplete {
                     debug! {"🟧 row complete"};
                     let finished_row = merger.row_complete(&mut chunk).await?;
-                    rows.insert(finished_row.row_key.clone(), finished_row);
+                    if let Some(ts_filter) = timestamp_filter {
+                        if let Some(ts_val) = finished_row
+                            .get_cells(super::TS_FAMILY, super::TS_KEY)
+                            .map(|mut v| v.pop())
+                            .unwrap_or_default()
+                        {
+                            if ts_val.value > ts_filter.to_be_bytes().to_vec() {
+                                rows.insert(finished_row.row_key.clone(), finished_row);
+                            }
+                        } else {
+                            // there's no TS_FAMILY:TS_KEY in the result
+                            rows.insert(finished_row.row_key.clone(), finished_row);
+                        }
+                    } else {
+                        // there's no filter specified.
+                        rows.insert(finished_row.row_key.clone(), finished_row);
+                    }
                 } else if chunk.has_commit_row() {
                     return Err(BigTableError::InvalidChunk(format!(
                         "Chunk tried to commit in row in wrong state {:?}",

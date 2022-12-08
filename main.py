@@ -210,6 +210,7 @@ def get_pending(uaid:bytes, options:Values) -> List[Tuple[bytes, int]]:
     all_rows = autopush.read_rows(
         filter_=filter
     )
+
     results = []
     for row in all_rows:
         for _cf, cols in row.cells.items():

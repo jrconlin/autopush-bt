@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use google_cloud_rust_raw::bigtable::v2::bigtable;
 use google_cloud_rust_raw::bigtable::v2::data;
@@ -21,6 +21,9 @@ pub type Qualifier = String;
 // This must be a String.
 pub type FamilyId = String;
 
+const TS_KEY: &str = "sortkey_timestamp";
+const TS_FAMILY: &str = "TS_SCAN";
+
 #[derive(Clone)]
 /// Wrapper for the BigTable connection
 pub struct BigTableClient {
@@ -28,6 +31,18 @@ pub struct BigTableClient {
     pub(crate) table_name: String,
     /// The client connection to BigTable.
     client: BigtableClient,
+}
+
+/// Return the current UTC as u64
+///
+/// Rust keeps time as u128, however BigTable stores it as i64, for now, we'll trim things
+/// down to u64 as a compromise and worry about it before we hit March 9th, 584_556_072.
+pub fn now() -> u64 {
+    let start = SystemTime::now();
+    let time = start
+        .duration_since(UNIX_EPOCH)
+        .expect("Failed to fetch timestamp");
+    time.as_micros() as u64
 }
 
 impl BigTableClient {
@@ -50,7 +65,11 @@ impl BigTableClient {
     }
 
     /// Read a given row from the row key.
-    pub async fn read_row(&self, row_key: &str) -> Result<Option<row::Row>, error::BigTableError> {
+    pub async fn read_row(
+        &self,
+        row_key: &str,
+        timestamp_filter: Option<u64>,
+    ) -> Result<Option<row::Row>, error::BigTableError> {
         debug!("Row key: {}", row_key);
 
         let mut row_keys = RepeatedField::default();
@@ -63,7 +82,7 @@ impl BigTableClient {
         req.set_table_name(self.table_name.clone());
         req.set_rows(row_set);
 
-        let rows = self.read_rows(req).await?;
+        let rows = self.read_rows(req, timestamp_filter, Some(1)).await?;
         Ok(rows.get(row_key).cloned())
     }
 
@@ -73,13 +92,15 @@ impl BigTableClient {
     pub async fn read_rows(
         &self,
         req: ReadRowsRequest,
+        timestamp_filter: Option<u64>,
+        limit: Option<u64>,
     ) -> Result<HashMap<RowKey, row::Row>, error::BigTableError> {
         let resp = self
             .client
             .clone()
             .read_rows(&req)
             .map_err(|e| error::BigTableError::BigTableRead(e.to_string()))?;
-        merge::RowMerger::process_chunks(resp).await
+        merge::RowMerger::process_chunks(resp, timestamp_filter, limit).await
     }
 
     /// write a given row.
@@ -95,6 +116,7 @@ impl BigTableClient {
         let mut mutations = protobuf::RepeatedField::default();
         req.set_table_name(self.table_name.clone());
         req.set_row_key(row.row_key.into_bytes());
+        let mut max_ts: Duration = Duration::default();
         for (_family, cells) in row.cells {
             for cell in cells {
                 let mut mutation = data::Mutation::default();
@@ -103,6 +125,9 @@ impl BigTableClient {
                     .timestamp
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map_err(|e| error::BigTableError::BigTableWrite(e.to_string()))?;
+                if timestamp > max_ts {
+                    max_ts = timestamp;
+                }
                 set_cell.family_name = cell.family;
                 set_cell.set_column_qualifier(cell.qualifier.into_bytes());
                 set_cell.set_value(cell.value);
@@ -112,6 +137,20 @@ impl BigTableClient {
                 mutation.set_set_cell(set_cell);
                 mutations.push(mutation);
             }
+        }
+        {
+            // add the max timestamp mutation
+            let mut set_cell = data::Mutation_SetCell{
+                family_name: TS_FAMILY.to_owned(),
+                ..Default::default()
+            };
+            set_cell.family_name = TS_FAMILY.to_owned();
+            set_cell.set_column_qualifier(TS_KEY.to_owned().into_bytes());
+            set_cell.set_value(now().to_be_bytes().to_vec());
+            set_cell.set_timestamp_micros((max_ts.as_millis() * 1000) as i64);
+            let mut mutation = data::Mutation::default();
+            mutation.set_set_cell(set_cell);
+            mutations.push(mutation);
         }
         req.set_mutations(mutations);
 

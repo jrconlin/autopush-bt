@@ -3,6 +3,7 @@ use std::{env, sync::Arc, time::SystemTime};
 
 use bigtable_client::{error::BigTableError, BigTableClient};
 use futures::executor::block_on;
+use google_cloud_rust_raw::bigtable::v2::bigtable::ReadRowsRequest;
 use grpcio::{ChannelCredentials, EnvBuilder};
 
 use google_cloud_rust_raw::bigtable::v2::{bigtable, data};
@@ -82,7 +83,7 @@ async fn get_uaids(client: &BigTableClient) -> Result<Vec<String>, BigTableError
     // yes, don't do this in production.
     Ok(client
         .clone()
-        .read_rows(req)
+        .read_rows(req, None, None)
         .await?
         .keys()
         .map(|v| v.to_owned())
@@ -107,6 +108,7 @@ async fn target_uaid(client: &BigTableClient) -> Result<String, BigTableError> {
 async fn async_main() {
     logging::init_logging(false);
     info!("starting");
+    let start = crate::bigtable_client::now();
     let table_name = env::var("DSN").unwrap_or_else(|_| {
         "projects/autopush-dev/instances/development-1/tables/autopush".to_owned()
     });
@@ -175,34 +177,39 @@ async fn async_main() {
 
     let data = "Amidst the mists and coldest frosts, I thrust my fists against the posts and still demand to see the ghosts".to_owned().into_bytes();
     let data_len = data.len();
-
-    // And write the cells.
-    let mut cells: HashMap<Qualifier, Vec<Cell>> = HashMap::new();
-    let mut cell_data: HashMap<Qualifier, Vec<u8>> = HashMap::new();
-    cell_data.insert("data".into(), data.clone());
-    cell_data.insert(
-        "sortkey_timestamp".into(),
-        u_now.as_secs().to_be_bytes().to_vec(),
-    );
-    cell_data.insert("headers".into(), "header, header, header".to_owned().into());
-    cells.insert("message".into(), fill_cells("message", ttl, cell_data));
-
     let chid_row_key = format!("{}#{}", &uaid, &chid);
 
-    let row = Row {
-        row_key: chid_row_key.clone(),
-        cells,
-    };
-    info!(
-        "📝 writing row {:?}, Data len: {}, timestamp: {:?}",
-        &chid_row_key, data_len, ttl
-    );
-    client.write_row(row).await.unwrap();
+    // And write the cells.
+    for i in 1..10 {
+        let random: u64 = rand::thread_rng().gen_range(1..10);
+        let mut cells: HashMap<Qualifier, Vec<Cell>> = HashMap::new();
+        let mut cell_data: HashMap<Qualifier, Vec<u8>> = HashMap::new();
+        cell_data.insert("data".into(), data.clone());
+        cell_data.insert(
+            "sortkey_timestamp".into(),
+            u_now.as_secs().to_be_bytes().to_vec(),
+        );
+        cell_data.insert("headers".into(), "header, header, header".to_owned().into());
+        cell_data.insert("randomy".into(), random.to_be_bytes().to_vec());
+
+        cells.insert("message".into(), fill_cells("message", ttl, cell_data));
+
+        let row = Row {
+            row_key: chid_row_key.clone(),
+            cells,
+        };
+        info!(
+            "📝 writing row {:?}:{}, Data len: {}, timestamp: {:?}",
+            &chid_row_key, i, data_len, ttl
+        );
+        client.write_row(row).await.unwrap();
+    }
 
     // std::thread::sleep(std::time::Duration::from_secs(5));
     info!("  Reading row {:?}", &chid_row_key);
-    match client.read_row(&chid_row_key).await.unwrap() {
+    match client.read_row(&chid_row_key, None).await.unwrap() {
         Some(read_row) => {
+            dbg!(&read_row.cells.keys());
             let row_data = read_row
                 .get_cells("message", "data")
                 .unwrap()
@@ -221,6 +228,42 @@ async fn async_main() {
         }
     };
 
+    info!("   Scanning data");
+    {
+        let mut req = ReadRowsRequest::default();
+        req.set_table_name(client.table_name.clone());
+        req.set_rows({
+            let mut row_keys = RepeatedField::default();
+            row_keys.push(chid_row_key.as_bytes().to_vec());
+            let mut row_set = data::RowSet::default();
+            row_set.set_row_keys(row_keys);
+            row_set
+        });
+        req.set_filter({
+            let v: u64 = 5;
+            let mut valrange = data::ValueRange::default();
+            valrange.set_start_value_open(v.to_be_bytes().to_vec());
+            let mut filter = data::RowFilter::default();
+            filter.set_value_range_filter(valrange);
+            filter
+        });
+        // pick a timestamp that we should have.
+        let sample = rand::thread_rng().sample(rand::distributions::Uniform::new(
+            start,
+            crate::bigtable_client::now(),
+        ));
+        debug!(
+            "Sampling from {} to {}: {}",
+            start,
+            crate::bigtable_client::now(),
+            sample
+        );
+
+        // try reading from it.
+        let result = client.read_rows(req, Some(start), None).await.unwrap();
+        dbg!(result);
+    }
+
     // deleting the data (an ack)
     info!(" Acking data");
     client
@@ -233,7 +276,7 @@ async fn async_main() {
         .await
         .unwrap();
 
-    match client.read_row(&chid_row_key).await.unwrap() {
+    match client.read_row(&chid_row_key, None).await.unwrap() {
         Some(read_row) => {
             if read_row.get_cells("message", "data").is_some() {
                 error!("🚨 Data not deleted")
