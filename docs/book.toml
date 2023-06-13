@@ -1,0 +1,15 @@
+[book]
+title = "Test Book"
+authors =  ["jr conlin"]
+description = "test book for screwing with mdbook and cargo docs"
+language = "en"
+
+[rust]
+edition = "2021"
+
+[build]
+build-dir = "output"
+
+[output.html]
+additional-css = ["style.css"]
+

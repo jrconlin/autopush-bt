@@ -105,6 +105,9 @@ async fn target_uaid(client: &BigTableClient) -> Result<String, BigTableError> {
     }
 }
 
+/// Start the application.
+///
+/// this does stuff
 async fn async_main() {
     logging::init_logging(false);
     info!("starting");

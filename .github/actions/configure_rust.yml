@@ -1,0 +1,5 @@
+
+steps:
+  - name: Configuring rust
+    uses: docker://rust/1-slim-buster
+  - run: cargo install 
