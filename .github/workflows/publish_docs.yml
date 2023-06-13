@@ -35,7 +35,7 @@ jobs:
         steps:
             # these are other job descriptions to call.
             - uses: actions/checkout@v3
-            - name: configuring rust
+            - name: Configure rust
               run: |
                 curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf -y | sh
                 rustup update
@@ -45,8 +45,8 @@ jobs:
               run: cd docs && mdbook build
             - name: Build API docs
               run: cargo doc --all-features --workspace --no-deps
-            - name: copying cargo docs to api dir
-              run: mkdir -p docs/output/api && cp target/doc/* docs/output/api
+            - name: Copy cargo docs to API dir
+              run: mkdir -p docs/output/api && cp -r target/doc/* docs/output/api
             - name: Upload artifact
               uses: actions/upload-pages-artifact@v1
               with:
