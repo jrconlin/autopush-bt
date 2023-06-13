@@ -34,11 +34,11 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             # these are other job descriptions to call.
+            - uses: actions/checkout@v3
             - name: configuring rust
               run: |
                 curl --proto '=https' --tlsv1.2 https://sh.rustup.rs -sSf -y | sh
                 rustup update
-            - uses: actions/checkout@v3
             - name: Install mdBook
               run: cargo install mdbook
             - name: Build the main book
